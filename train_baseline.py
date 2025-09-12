@@ -104,7 +104,11 @@ class SiglipAsTextEncoder(nn.Module):
         seq_feats = self.hidden_proj(penultimate)
         seq_feats = self.hidden_ln(seq_feats)
         # Learnable resampling to exactly target_seq_len tokens
-        seq_feats = self.resampler(seq_feats)
+        base = seq_feats
+        seq_feats = self.resampler(base)
+        # Add a small residual from mean token to avoid all-zero signal at init
+        mean_tok = base.mean(dim=1, keepdim=True).expand(-1, self.target_seq_len, -1)
+        seq_feats = seq_feats + 0.05 * mean_tok
         seq_feats = self.post_ln(seq_feats) * self.out_scale
 
         pooled = getattr(out, "pooler_output", None)
@@ -147,8 +151,8 @@ class TokenResampler(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        # conservative init to avoid large outputs at start
-        nn.init.zeros_(self.out_proj.weight)
+        # small-output init (not all-zero): tiny normal
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.out_proj.bias)
         self.dropout = nn.Dropout(dropout)
         self.ln_q = nn.LayerNorm(d_model)
