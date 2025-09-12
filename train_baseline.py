@@ -237,7 +237,7 @@ def swap_text_encoder_2_for_siglip(
         target_hidden_size=target_hidden,
         target_proj_dim=target_proj,
         target_seq_len=target_seq_len,
-        double_pooled=single_encoder,
+        double_pooled=False,
     )
     # Align tokenizer_2 max length with SigLIP's capacity to avoid 77 vs 64 mismatch
     try:
@@ -801,6 +801,7 @@ def train():
                 (0, 0),
                 (1024, 1024),
                 dtype=unet.dtype,
+                text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
             )
             add_time_ids = add_time_ids.to(device)
 
