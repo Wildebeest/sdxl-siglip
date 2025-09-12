@@ -93,28 +93,38 @@ class SiglipAsTextEncoder(nn.Module):
         return _AdapterOutput(pooled, hs)
 
 
-def swap_text_encoder_2_for_siglip(pipe: StableDiffusionXLPipeline, siglip_id: str, freeze_siglip: bool = True) -> StableDiffusionXLPipeline:
+def swap_text_encoder_2_for_siglip(
+    pipe: StableDiffusionXLPipeline,
+    siglip_id: str,
+    freeze_siglip: bool = True,
+    single_encoder: bool = False,
+) -> StableDiffusionXLPipeline:
     """Replace `tokenizer_2`/`text_encoder_2` with SigLIP + linear projections.
 
     The adapter preserves the concatenated text-embedding shape and the pooled
     projection dim expected by SDXL's UNet additional conditioning.
     """
 
-    # Take dimensions from the original CLIP-2
+    # Record original TE2 dims to keep pooled projection consistent
     orig_te2 = pipe.text_encoder_2
     if orig_te2 is None:
         raise ValueError("This pipeline does not define text_encoder_2.")
 
-    try:
-        target_hidden = int(getattr(orig_te2.config, "hidden_size"))
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("Could not infer original text_encoder_2 hidden size.") from e
+    # For single-encoder mode, we must match UNet cross-attn dim directly.
+    # Otherwise, we mimic the original TE2 hidden size (and rely on concat).
+    if single_encoder:
+        target_hidden = int(pipe.unet.config.cross_attention_dim)
+    else:
+        try:
+            target_hidden = int(getattr(orig_te2.config, "hidden_size"))
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("Could not infer original text_encoder_2 hidden size.") from e
 
     target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
 
     # Create SigLIP tokenizer and match sequence length with the remaining tokenizer
     tokenizer_2 = AutoTokenizer.from_pretrained(siglip_id, use_fast=True)
-    # Ensure matching sequence length so concatenation over last dim works
+    # Ensure matching sequence length with the other tokenizer if present
     if pipe.tokenizer is not None and hasattr(pipe.tokenizer, "model_max_length"):
         tokenizer_2.model_max_length = int(pipe.tokenizer.model_max_length)
 
@@ -126,6 +136,11 @@ def swap_text_encoder_2_for_siglip(pipe: StableDiffusionXLPipeline, siglip_id: s
 
     pipe.tokenizer_2 = tokenizer_2
     pipe.text_encoder_2 = adapter
+
+    # In single-encoder mode, drop the first encoder entirely.
+    if single_encoder:
+        pipe.tokenizer = None
+        pipe.text_encoder = None
     return pipe
 
 
@@ -202,7 +217,7 @@ def save_adapter(adapter: SiglipAsTextEncoder, out_dir: str):
 
 
 def train():
-    parser = argparse.ArgumentParser(description="SDXL baseline: swap CLIP-2 with SigLIP + linear proj and train the projection layers")
+    parser = argparse.ArgumentParser(description="SDXL baseline: use SigLIP (+ linear proj) as the sole text encoder or as a drop-in for CLIP-2")
     parser.add_argument("--pretrained_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
     parser.add_argument("--siglip_model", type=str, default="google/siglip-so400m-patch14-384")
     parser.add_argument("--output_dir", type=str, default="outputs/siglip-baseline")
@@ -234,7 +249,7 @@ def train():
     ).to(device)
 
     # Replace CLIP-2 with SigLIP + linear projections
-    pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True)
+    pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
 
     # Train only the projection layers
     params = list(pipe.text_encoder_2.hidden_proj.parameters()) + list(pipe.text_encoder_2.pool_proj.parameters())
@@ -327,4 +342,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-

@@ -26,7 +26,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pipe = pipe.to(device)
 
-    pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True)
+    pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
 
     image = pipe(
         prompt=args.prompt,
@@ -45,4 +45,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
