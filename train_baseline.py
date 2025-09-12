@@ -802,7 +802,7 @@ def train():
                 if is_main:
                     accelerator.print(f"Non-finite loss at step {step}; skipping optimizer step. loss={loss}")
                     try:
-                        import json, os
+                        import json
                         def _stats(x):
                             try:
                                 x32 = x.detach().float()
