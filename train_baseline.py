@@ -600,11 +600,8 @@ def train():
             amp_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
             with torch.no_grad():
                 with amp_ctx:
-                    latents = to_latents(vae, images, dtype=(torch.float32 if use_fp32 else unet.dtype))
+                    latents = to_latents(vae, images, dtype=unet.dtype)
             noisy_latents, noise, timesteps = add_noise(latents, noise_scheduler)
-            if use_fp32:
-                noisy_latents = noisy_latents.float()
-                noise = noise.float()
 
             # Text conditioning (uses our swapped SigLIP encoder for pooled + seq embeds)
             prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_text(
