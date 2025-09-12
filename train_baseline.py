@@ -598,9 +598,27 @@ def train():
             use_fp32 = step < args.safe_start_steps
             # Latents (no grad for VAE encode) in safe-start precision
             amp_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
-            with torch.no_grad():
-                with amp_ctx:
-                    latents = to_latents(vae, images, dtype=unet.dtype)
+            if use_fp32:
+                # Force VAE encode path to float32 to avoid fp16 instability
+                with torch.no_grad():
+                    try:
+                        vae_dtype = next(vae.parameters()).dtype
+                    except StopIteration:
+                        vae_dtype = unet.dtype
+                    vae.to(dtype=torch.float32)
+                    latents = vae.encode(images.float()).latent_dist.sample() * vae.config.scaling_factor
+                    # Retry with clamped input if non-finite
+                    if not torch.isfinite(latents).all():
+                        if is_main and args.debug_log:
+                            accelerator.print("VAE latents non-finite; retrying encode with clamped images")
+                        latents = vae.encode(images.float().clamp_(-1, 1)).latent_dist.sample() * vae.config.scaling_factor
+                    # Restore VAE dtype
+                    vae.to(dtype=vae_dtype)
+                    latents = latents.to(device=unet.device, dtype=unet.dtype)
+            else:
+                with torch.no_grad():
+                    with amp_ctx:
+                        latents = to_latents(vae, images, dtype=unet.dtype)
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
                 def _stats(x):
                     x32 = x.detach().float()
@@ -646,7 +664,7 @@ def train():
                 # If still non-finite, attempt manual compose for diagnostics
                 if not torch.isfinite(noisy_latents_f32).all() and args.debug_log and is_main:
                     try:
-                        ac = noise_scheduler.alphas_cumprod.detach().float()
+                        ac = noise_scheduler.alphas_cumprod.detach().float().to(lat_f32.device)
                         a_t = ac[timesteps]
                         sqrt_a = a_t.sqrt().view(-1, 1, 1, 1)
                         sqrt_om = (1 - a_t).clamp(0, 1).sqrt().view(-1, 1, 1, 1)
