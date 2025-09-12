@@ -251,6 +251,17 @@ def train():
     # Replace CLIP-2 with SigLIP + linear projections
     pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
 
+    # Hard-freeze: UNet and VAE params (saves memory/compute)
+    for p in pipe.unet.parameters():
+        p.requires_grad = False
+    for p in pipe.vae.parameters():
+        p.requires_grad = False
+    # SigLIP base is already frozen inside swap; keep adapter trainable
+    pipe.unet.eval()
+    pipe.vae.eval()
+    if hasattr(pipe.text_encoder_2, "model"):
+        pipe.text_encoder_2.model.eval()
+
     # Train only the projection layers
     params = list(pipe.text_encoder_2.hidden_proj.parameters()) + list(pipe.text_encoder_2.pool_proj.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr)
@@ -280,8 +291,9 @@ def train():
         with accelerator.accumulate(unet):
             images = images.to(device)
 
-            # Latents
-            latents = to_latents(vae, images, dtype=unet.dtype)
+            # Latents (no grad for VAE encode)
+            with torch.no_grad():
+                latents = to_latents(vae, images, dtype=unet.dtype)
             noisy_latents, noise, timesteps = add_noise(latents, noise_scheduler)
 
             # Text conditioning (uses our swapped SigLIP encoder for pooled + seq embeds)
