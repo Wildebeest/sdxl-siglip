@@ -18,6 +18,7 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 )
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer
+from torch.cuda.amp import autocast
 import wandb
 
 # Optional: Backblaze B2 SDK for checkpoint uploads
@@ -259,7 +260,8 @@ def encode_text(pipe: StableDiffusionXLPipeline, prompts, device, guidance_scale
         enc = tok(list(prompts), padding="max_length", truncation=True, max_length=max_len, return_tensors="pt")
         input_ids = enc["input_ids"].to(device)
 
-        out = te(input_ids=input_ids, attention_mask=None, output_hidden_states=True)
+        with autocast(enabled=False):
+            out = te(input_ids=input_ids, attention_mask=None, output_hidden_states=True)
         seq = out.hidden_states[-2]  # [B, 77, cross_attention_dim] after adapter
         pooled = out[0]              # [B, proj_dim]
 
@@ -273,7 +275,8 @@ def encode_text(pipe: StableDiffusionXLPipeline, prompts, device, guidance_scale
         if do_cfg:
             neg = tok([""] * len(prompts), padding="max_length", truncation=True, max_length=max_len, return_tensors="pt")
             n_input_ids = neg["input_ids"].to(device)
-            nout = te(input_ids=n_input_ids, attention_mask=None, output_hidden_states=True)
+            with autocast(enabled=False):
+                nout = te(input_ids=n_input_ids, attention_mask=None, output_hidden_states=True)
             nseq = nout.hidden_states[-2]
             npooled = nout[0]
             negative_prompt_embeds = nseq.to(dtype=dtype, device=device)
