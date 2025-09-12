@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -75,6 +76,8 @@ class SiglipAsTextEncoder(nn.Module):
 
         # Lightweight learnable resampler: learnable queries attend over token sequence
         self.resampler = TokenResampler(d_model=target_hidden_size, target_len=self.target_seq_len, num_heads=4)
+        self.post_ln = nn.LayerNorm(target_hidden_size)
+        self.out_scale = 1.0 / math.sqrt(float(target_hidden_size))
 
         # Minimal config shim used by SDXL to read `projection_dim`
         @dataclass
@@ -101,6 +104,7 @@ class SiglipAsTextEncoder(nn.Module):
         seq_feats = self.hidden_ln(seq_feats)
         # Learnable resampling to exactly target_seq_len tokens
         seq_feats = self.resampler(seq_feats)
+        seq_feats = self.post_ln(seq_feats) * self.out_scale
 
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
@@ -142,6 +146,9 @@ class TokenResampler(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+        # conservative init to avoid large outputs at start
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
         self.dropout = nn.Dropout(dropout)
         self.ln_q = nn.LayerNorm(d_model)
         self.ln_kv = nn.LayerNorm(d_model)
@@ -219,7 +226,12 @@ def swap_text_encoder_2_for_siglip(
 
     # Move adapter to the same device as UNet (pipeline primary device)
     try:
-        adapter = adapter.to(getattr(pipe.unet, "device", next(pipe.unet.parameters()).device))
+        dev = getattr(pipe.unet, "device", next(pipe.unet.parameters()).device)
+        # Prefer bf16 for adapter math if available; we'll cast outputs to UNet dtype later
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            adapter = adapter.to(device=dev, dtype=torch.bfloat16)
+        else:
+            adapter = adapter.to(device=dev)
     except Exception:
         adapter = adapter.to("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -255,7 +267,8 @@ def encode_text(pipe: StableDiffusionXLPipeline, prompts, device, guidance_scale
         seq = out.hidden_states[-2]  # [B, 77, cross_attention_dim] after adapter
         pooled = out[0]              # [B, proj_dim]
 
-        dtype = te.dtype if hasattr(te, "dtype") else pipe.unet.dtype
+        # Use UNet dtype for encoder_hidden_states to match attention kernels
+        dtype = pipe.unet.dtype
         prompt_embeds = seq.to(dtype=dtype, device=device)
         pooled_prompt_embeds = pooled.to(dtype=dtype, device=device)
 
