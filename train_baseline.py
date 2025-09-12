@@ -94,14 +94,13 @@ class SiglipAsTextEncoder(nn.Module):
             penultimate = out.last_hidden_state
 
         seq_feats = self.hidden_proj(penultimate)
-        # Ensure sequence length matches what SDXL expects (typically 77)
+        # Resample sequence length to the fixed target using 1D interpolation
+        # Works for both downsampling (>77) and upsampling (<77)
         b, l, h = seq_feats.shape
-        tsl = self.target_seq_len
-        if l < tsl:
-            pad = torch.zeros((b, tsl - l, h), device=seq_feats.device, dtype=seq_feats.dtype)
-            seq_feats = torch.cat([seq_feats, pad], dim=1)
-        elif l > tsl:
-            seq_feats = seq_feats[:, :tsl]
+        if l != self.target_seq_len:
+            seq_feats = F.interpolate(
+                seq_feats.transpose(1, 2), size=self.target_seq_len, mode="linear", align_corners=False
+            ).transpose(1, 2)
 
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
@@ -192,14 +191,51 @@ def swap_text_encoder_2_for_siglip(
 
 
 def encode_text(pipe: StableDiffusionXLPipeline, prompts, device, guidance_scale: float = 5.0):
+    """Encode prompts for training.
+
+    If we've replaced SDXL text encoders with a single SigLIP adapter (tokenizer is None),
+    compute embeddings directly using tokenizer_2/text_encoder_2 and return the 4-tuple that
+    SDXL training expects. Otherwise, delegate to pipeline.encode_prompt.
+    """
     do_cfg = guidance_scale > 1.0
-    out = pipe.encode_prompt(
+
+    # SigLIP-only path (tokenizer removed, tokenizer_2 + text_encoder_2 present)
+    if getattr(pipe, "tokenizer", None) is None and hasattr(pipe, "tokenizer_2") and hasattr(pipe, "text_encoder_2"):
+        tok = pipe.tokenizer_2
+        te = pipe.text_encoder_2
+        max_len = int(getattr(tok, "model_max_length", getattr(te, "target_seq_len", 77)) or 77)
+
+        enc = tok(list(prompts), padding="max_length", truncation=True, max_length=max_len, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+
+        out = te(input_ids=input_ids, attention_mask=None, output_hidden_states=True)
+        seq = out.hidden_states[-2]  # [B, 77, cross_attention_dim] after adapter
+        pooled = out[0]              # [B, proj_dim]
+
+        dtype = te.dtype if hasattr(te, "dtype") else pipe.unet.dtype
+        prompt_embeds = seq.to(dtype=dtype, device=device)
+        pooled_prompt_embeds = pooled.to(dtype=dtype, device=device)
+
+        negative_prompt_embeds = None
+        negative_pooled_prompt_embeds = None
+        if do_cfg:
+            neg = tok([""] * len(prompts), padding="max_length", truncation=True, max_length=max_len, return_tensors="pt")
+            n_input_ids = neg["input_ids"].to(device)
+            nout = te(input_ids=n_input_ids, attention_mask=None, output_hidden_states=True)
+            nseq = nout.hidden_states[-2]
+            npooled = nout[0]
+            negative_prompt_embeds = nseq.to(dtype=dtype, device=device)
+            negative_pooled_prompt_embeds = npooled.to(dtype=dtype, device=device)
+
+        return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+
+    # Default SDXL path
+    return pipe.encode_prompt(
         prompts,
         device=device,
         do_classifier_free_guidance=do_cfg,
         negative_prompt=[""] * len(prompts) if do_cfg else None,
     )
-    return out
 
 
 def to_latents(vae: AutoencoderKL, images: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -407,7 +443,9 @@ def train():
 
     # Replace CLIP-2 with SigLIP + linear projections
     if not args.no_siglip:
-        pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=False)
+        # Single-encoder mode: remove TE1/TE2 and feed UNet with SigLIP projected to cross_attention_dim,
+        # with sequence resampled to 77 tokens.
+        pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
 
     # Hard-freeze: UNet and VAE params (saves memory/compute)
     for p in pipe.unet.parameters():
@@ -420,8 +458,12 @@ def train():
     if hasattr(pipe.text_encoder_2, "model"):
         pipe.text_encoder_2.model.eval()
 
-    # Train only the projection layers
-    params = list(pipe.text_encoder_2.hidden_proj.parameters()) + list(pipe.text_encoder_2.pool_proj.parameters())
+    # Train only the projection layers (SigLIP adapter) when present
+    if hasattr(pipe.text_encoder_2, "hidden_proj") and hasattr(pipe.text_encoder_2, "pool_proj"):
+        params = list(pipe.text_encoder_2.hidden_proj.parameters()) + list(pipe.text_encoder_2.pool_proj.parameters())
+    else:
+        # Fallback: no-op tiny parameter to keep optimizer valid (should not be used in SigLIP mode)
+        params = list(pipe.unet.parameters())[:0]
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
     # Use the pipeline's scheduler/vae/unet directly
@@ -498,6 +540,11 @@ def train():
             prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_text(
                 pipe, texts, device=device, guidance_scale=args.guidance_scale
             )
+
+            # Sanity: ensure encoder_hidden_states have shape [B, T, C]
+            assert prompt_embeds.dim() == 3, f"prompt_embeds dim {prompt_embeds.shape}"
+            if negative_prompt_embeds is not None:
+                assert negative_prompt_embeds.dim() == 3, f"neg_prompt_embeds dim {negative_prompt_embeds.shape}"
 
             # Pack added time ids used by SDXL
             add_text_embeds = pooled_prompt_embeds
