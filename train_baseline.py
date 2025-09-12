@@ -261,7 +261,12 @@ def train():
     parser.add_argument("--pretrained_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
     parser.add_argument("--siglip_model", type=str, default="google/siglip-so400m-patch14-384")
     parser.add_argument("--output_dir", type=str, default="outputs/siglip-baseline")
-    parser.add_argument("--train_urls", type=str, help="WebDataset shard pattern, e.g. /path/shards/{0000..0999}.tar")
+    parser.add_argument(
+        "--train_urls",
+        type=str,
+        default="https://f001.backblazeb2.com/file/ImageTrainingData/laion-pop-fixed/shard-{000000..000046}.tar",
+        help="WebDataset shard pattern (default: 47 shards from 000000..000046 on Backblaze B2)",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_steps", type=int, default=1000)
