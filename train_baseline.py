@@ -227,11 +227,7 @@ def swap_text_encoder_2_for_siglip(
     # Move adapter to the same device as UNet (pipeline primary device)
     try:
         dev = getattr(pipe.unet, "device", next(pipe.unet.parameters()).device)
-        # Prefer bf16 for adapter math if available; we'll cast outputs to UNet dtype later
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            adapter = adapter.to(device=dev, dtype=torch.bfloat16)
-        else:
-            adapter = adapter.to(device=dev)
+        adapter = adapter.to(device=dev)
     except Exception:
         adapter = adapter.to("cuda" if torch.cuda.is_available() else "cpu")
 
