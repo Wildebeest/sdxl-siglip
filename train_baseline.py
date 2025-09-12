@@ -555,8 +555,17 @@ def train():
         pipe.text_encoder_2.model.eval()
 
     # Train only the projection layers (SigLIP adapter) when present
-    if hasattr(pipe.text_encoder_2, "hidden_proj") and hasattr(pipe.text_encoder_2, "pool_proj"):
-        params = list(pipe.text_encoder_2.hidden_proj.parameters()) + list(pipe.text_encoder_2.pool_proj.parameters())
+    if hasattr(pipe.text_encoder_2, "hidden_proj") and (
+        hasattr(pipe.text_encoder_2, "pool_proj") or (
+            hasattr(pipe.text_encoder_2, "pool_proj_1") and hasattr(pipe.text_encoder_2, "pool_proj_2")
+        )
+    ):
+        params = list(pipe.text_encoder_2.hidden_proj.parameters())
+        if hasattr(pipe.text_encoder_2, "pool_proj"):
+            params += list(pipe.text_encoder_2.pool_proj.parameters())
+        else:
+            params += list(pipe.text_encoder_2.pool_proj_1.parameters())
+            params += list(pipe.text_encoder_2.pool_proj_2.parameters())
     else:
         # Fallback: no-op tiny parameter to keep optimizer valid (should not be used in SigLIP mode)
         params = list(pipe.unet.parameters())[:0]
