@@ -799,6 +799,12 @@ def train():
             if negative_pooled_prompt_embeds is not None:
                 negative_pooled_prompt_embeds = fit_text_dim(negative_pooled_prompt_embeds, needed_text_dim)
 
+            if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                accelerator.print(
+                    f"add_embed debug: in_features={in_features} time_dim={time_dim} needed_text_dim={needed_text_dim} "
+                    f"pooled_dim={int(pooled_prompt_embeds.shape[-1])} add_text_dim={int(add_text_embeds.shape[-1])}"
+                )
+
             # CFG
             autocast_ctx = amp_ctx
             if args.guidance_scale > 1.0:
