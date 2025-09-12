@@ -101,6 +101,9 @@ fi
 
 REMOTE_DIR_REMOTE="${REMOTE_DIR/#\~/\$HOME}"
 REMOTE_DIR_TILDE="$REMOTE_DIR"
+# Shell-escape values for safe injection into remote script
+EXTRA_ARGS_ESC=$(printf %q "$EXTRA_ARGS")
+TRAIN_URLS_ESC=$(printf %q "$TRAIN_URLS")
 REMOTE_BOOTSTRAP='set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
@@ -164,7 +167,7 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
-ARGS="$EXTRA_ARGS"
+ARGS='"$EXTRA_ARGS_ESC"'
 # ensure per-run output dir unless provided by user
 case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${run_id}";; esac
 # keep W&B files under the run dir unless overridden
@@ -174,13 +177,13 @@ if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
 # Resolve uv binary once, then background exactly one process
 UVBIN="$HOME/.local/bin/uv"; command -v "$UVBIN" >/dev/null 2>&1 || UVBIN="uv"
-nohup "$UVBIN" run python train_baseline.py --train_urls "$TRAIN_URLS" $ARGS > "$log" 2>&1 &
+nohup "$UVBIN" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
 echo $! > "$run_dir/train.pid"
 echo "Started PID $(cat "$run_dir/train.pid")"
 echo "$run_dir/train.log"
 '
   # Pass TRAIN_URLS and EXTRA_ARGS via SSH env to avoid local-side quoting issues
-  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" env TRAIN_URLS="$TRAIN_URLS" EXTRA_ARGS="$EXTRA_ARGS" bash -lc "$START_BG" | tail -n 1)
+  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG" | tail -n 1)
   echo "Remote training started. Tail logs with:"
   echo "$SSH_CMD ${SSH_OPTS[*]} $HOST bash -lc 'cd $REMOTE_DIR_REMOTE; tail -f $LOGFILE'"
 else
@@ -192,7 +195,7 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
-ARGS="$EXTRA_ARGS"
+ARGS='"$EXTRA_ARGS_ESC"'
 # create run dir and set outputs
 ts=$(date +%Y%m%d_%H%M%S)
 rnd=${RANDOM}
@@ -211,9 +214,8 @@ export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-"$HOME/.local/bin/uv" run python train_baseline.py --train_urls "$TRAIN_URLS" $ARGS 2>&1 | tee "$log" || uv run python train_baseline.py --train_urls "$TRAIN_URLS" $ARGS 2>&1 | tee -a "$log"
+"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" || uv run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee -a "$log"
 '
-  # Pass TRAIN_URLS and EXTRA_ARGS via SSH env to avoid local-side quoting issues
-  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" env TRAIN_URLS="$TRAIN_URLS" EXTRA_ARGS="$EXTRA_ARGS" bash -lc "$START_FG"
+  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG"
   echo "Remote training finished."
 fi
