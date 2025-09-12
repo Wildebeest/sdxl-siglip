@@ -76,10 +76,21 @@ force_kill() {
   fi
 }
 
-PID_FILE="train.pid"
-if [[ -f "$PID_FILE" ]]; then
+pick_pid_file() {
+  # Prefer newest per-run pid under runs/, then fallback to repo root
+  local f
+  f=$(ls -1t runs/*/train.pid 2>/dev/null | head -n1 || true)
+  if [[ -z "$f" && -f train.pid ]]; then
+    f="train.pid"
+  fi
+  echo "$f"
+}
+
+PID_FILE=$(pick_pid_file)
+if [[ -n "$PID_FILE" && -f "$PID_FILE" ]]; then
+  echo "Using PID file: $PID_FILE"
   PID=$(cat "$PID_FILE" || true)
-  echo "Found $PID_FILE with PID: $PID"
+  echo "PID: $PID"
   kill_pid "$PID"
   sleep '"$GRACE"'
   if kill -0 "$PID" 2>/dev/null; then
@@ -92,7 +103,7 @@ if [[ -f "$PID_FILE" ]]; then
     rm -f "$PID_FILE"
   fi
 else
-  echo "No $PID_FILE; falling back to pkill by command line"
+  echo "No PID file found; falling back to pkill by command line"
   # Try to catch foreground or detached runs
   pkill -f "uv run python train_baseline.py" || true
   pkill -f "python train_baseline.py" || true

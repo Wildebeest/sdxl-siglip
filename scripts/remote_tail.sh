@@ -56,10 +56,15 @@ REMOTE_CMD='set -euo pipefail
 cd '"$REMOTE_DIR"' 2>/dev/null || { echo "Remote dir not found: '"$REMOTE_DIR"'"; exit 3; }
 file='"$LOG_FILE"'
 if [[ -z "$LOG_FILE" ]]; then
-  file=$(ls -1t train_*.log 2>/dev/null | head -n1 || true)
+  # Prefer newest per-run log under runs/, then fall back to repo root
+  newest=$(ls -1t runs/*/train*.log 2>/dev/null | head -n1 || true)
+  if [[ -z "$newest" ]]; then
+    newest=$(ls -1t train_*.log 2>/dev/null | head -n1 || true)
+  fi
+  file="$newest"
 fi
 if [[ -z "$file" ]]; then
-  echo "No log files found (train_*.log)"
+  echo "No log files found (runs/*/train*.log or train_*.log)"
   exit 4
 fi
 echo "Tailing: $file"
