@@ -601,6 +601,19 @@ def train():
             with torch.no_grad():
                 with amp_ctx:
                     latents = to_latents(vae, images, dtype=unet.dtype)
+            if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                def _stats(x):
+                    x32 = x.detach().float()
+                    return {
+                        "shape": tuple(x32.shape),
+                        "min": float(x32.min().item()),
+                        "max": float(x32.max().item()),
+                        "mean": float(x32.mean().item()),
+                        "std": float(x32.std(unbiased=False).item()),
+                        "norm": float(x32.norm().item()),
+                        "finite": bool(torch.isfinite(x32).all().item()),
+                    }
+                accelerator.print(f"latents(pre-noise): {_stats(latents)}")
             # Add noise: in safe-start, compute in float32 and restrict timestep band
             if use_fp32:
                 lat_f32 = latents.float()
@@ -610,11 +623,37 @@ def train():
                 t_high = max(t_low + 1, int(0.8 * num_ts))
                 timesteps = torch.randint(t_low, t_high, (bsz,), device=lat_f32.device, dtype=torch.long)
                 noise_f32 = torch.randn_like(lat_f32)
+                # Scheduler buffer stats
+                if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                    try:
+                        ac = noise_scheduler.alphas_cumprod.detach().float()
+                        al_st = {
+                            "shape": tuple(ac.shape),
+                            "min": float(ac.min().item()),
+                            "max": float(ac.max().item()),
+                            "dtype": str(noise_scheduler.alphas_cumprod.dtype),
+                        }
+                    except Exception:
+                        al_st = {"info": "no alphas_cumprod"}
+                    accelerator.print(f"scheduler: num_ts={num_ts} band=[{t_low},{t_high}) alphas_cumprod={al_st}")
                 noisy_latents_f32 = noise_scheduler.add_noise(lat_f32, noise_f32, timesteps)
                 # Retry once if non-finite
                 if not torch.isfinite(noisy_latents_f32).all():
+                    if is_main and args.debug_log:
+                        accelerator.print("noisy_latents had non-finite values; retrying with clamped latents and new noise")
                     noise_f32 = torch.randn_like(lat_f32)
                     noisy_latents_f32 = noise_scheduler.add_noise(lat_f32.clamp_(-10, 10), noise_f32, timesteps)
+                # If still non-finite, attempt manual compose for diagnostics
+                if not torch.isfinite(noisy_latents_f32).all() and args.debug_log and is_main:
+                    try:
+                        ac = noise_scheduler.alphas_cumprod.detach().float()
+                        a_t = ac[timesteps]
+                        sqrt_a = a_t.sqrt().view(-1, 1, 1, 1)
+                        sqrt_om = (1 - a_t).clamp(0, 1).sqrt().view(-1, 1, 1, 1)
+                        manual_noisy = sqrt_a * lat_f32 + sqrt_om * noise_f32
+                        accelerator.print(f"manual add_noise stats: {_stats(manual_noisy)} sqrt_a=[{float(sqrt_a.min()):.4g},{float(sqrt_a.max()):.4g}] sqrt_om=[{float(sqrt_om.min()):.4g},{float(sqrt_om.max()):.4g}]")
+                    except Exception as e:
+                        accelerator.print(f"manual add_noise failed: {e}")
                 noisy_latents = noisy_latents_f32.to(dtype=unet.dtype)
                 noise = noise_f32.to(dtype=unet.dtype)
             else:
