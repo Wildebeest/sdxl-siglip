@@ -655,9 +655,32 @@ def train():
                     vae.to(dtype=vae_dtype)
                     latents = latents.to(device=unet.device, dtype=unet.dtype)
             else:
+                # Regular path: encode with current dtype, but guard against non-finite inputs/outputs
+                # Sanitize images if they contain non-finite values
+                if not torch.isfinite(images).all():
+                    if is_main and args.debug_log:
+                        accelerator.print("images contained non-finite values; applying nan_to_num and clamp")
+                    images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1, 1)
                 with torch.no_grad():
                     with amp_ctx:
                         latents = to_latents(vae, images, dtype=unet.dtype)
+                if not torch.isfinite(latents).all():
+                    if is_main and args.debug_log:
+                        accelerator.print("VAE latents non-finite post-encode; retrying encode in float32 with clamped images")
+                    with torch.no_grad():
+                        try:
+                            vae_dtype = next(vae.parameters()).dtype
+                        except StopIteration:
+                            vae_dtype = unet.dtype
+                        vae.to(dtype=torch.float32)
+                        latents = vae.encode(images.float().clamp_(-1, 1)).latent_dist.sample() * vae.config.scaling_factor
+                        vae.to(dtype=vae_dtype)
+                        latents = latents.to(device=unet.device, dtype=unet.dtype)
+                    if not torch.isfinite(latents).all():
+                        if is_main:
+                            accelerator.print("Latents still non-finite after retry; skipping batch")
+                        step += 1
+                        continue
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
                 def _stats(x):
                     x32 = x.detach().float()
