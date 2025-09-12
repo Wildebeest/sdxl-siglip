@@ -478,6 +478,8 @@ def train():
     parser.add_argument("--b2_bucket", type=str, default=os.environ.get("B2_BUCKET", "sdxl-siglip"))
     parser.add_argument("--b2_prefix", type=str, default=os.environ.get("B2_PREFIX"))
     parser.add_argument("--no_siglip", action="store_true", help="Disable SigLIP swap; train baseline SDXL text encoders")
+    parser.add_argument("--safe_start_steps", type=int, default=50, help="Run first N steps with autocast disabled for extra numerical safety")
+    parser.add_argument("--debug_log", action="store_true", help="Print debug stats (embeddings/noise preds/grad norms) periodically")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -599,6 +601,21 @@ def train():
                 pipe, texts, device=device, guidance_scale=args.guidance_scale
             )
 
+            # Debug: print embedding stats
+            if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                def stats(x):
+                    x32 = x.detach().float()
+                    return {
+                        "shape": tuple(x32.shape),
+                        "min": float(x32.min().item()),
+                        "max": float(x32.max().item()),
+                        "mean": float(x32.mean().item()),
+                        "std": float(x32.std(unbiased=False).item()),
+                        "norm": float(x32.norm().item()),
+                    }
+                accelerator.print(f"prompt_embeds: {stats(prompt_embeds)}")
+                accelerator.print(f"pooled_prompt: {stats(pooled_prompt_embeds)}")
+
             # Sanity: ensure encoder_hidden_states have shape [B, T, C]
             assert prompt_embeds.dim() == 3, f"prompt_embeds dim {prompt_embeds.shape}"
             if negative_prompt_embeds is not None:
@@ -616,31 +633,48 @@ def train():
             add_time_ids = add_time_ids.to(device)
 
             # CFG
+            use_fp32 = step < args.safe_start_steps
+            autocast_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
             if args.guidance_scale > 1.0:
-                noise_pred_uncond = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    added_cond_kwargs={"text_embeds": negative_pooled_prompt_embeds, "time_ids": add_time_ids},
-                ).sample
-                noise_pred_text = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={"text_embeds": add_text_embeds, "time_ids": add_time_ids},
-                ).sample
+                with autocast_ctx:
+                    noise_pred_uncond = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        added_cond_kwargs={"text_embeds": negative_pooled_prompt_embeds, "time_ids": add_time_ids},
+                    ).sample
+                    noise_pred_text = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs={"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+                    ).sample
                 noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
             else:
-                noise_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={"text_embeds": add_text_embeds, "time_ids": add_time_ids},
-                ).sample
+                with autocast_ctx:
+                    noise_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs={"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+                    ).sample
 
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
+            if not torch.isfinite(loss):
+                if is_main:
+                    accelerator.print(f"Non-finite loss at step {step}; skipping optimizer step. loss={loss}")
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
+                continue
+
             accelerator.backward(loss)
+            if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                total_norm = 0.0
+                for p in params:
+                    if p.grad is not None:
+                        total_norm += float(p.grad.detach().data.float().norm().item())
+                accelerator.print(f"grad_norm (sum of norms): {total_norm:.6f}")
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
