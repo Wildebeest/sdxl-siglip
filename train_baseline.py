@@ -237,6 +237,14 @@ def train():
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=os.environ.get("WANDB_MODE", "online"), choices=["online", "offline", "disabled"]) 
+    # image logging options
+    parser.add_argument("--log_images_every", type=int, default=200, help="Log sample images to W&B every N steps; 0 disables")
+    parser.add_argument("--sample_prompts", type=str, default="a corgi wearing sunglasses|||a cinematic portrait, 85mm, shallow depth of field|||a sleek red sports car driving at night, rain, reflections",
+                        help="Prompts separated by '|||' for periodic image logging")
+    parser.add_argument("--sample_steps", type=int, default=20)
+    parser.add_argument("--sample_height", type=int, default=768)
+    parser.add_argument("--sample_width", type=int, default=768)
+    parser.add_argument("--sample_seed", type=int, default=12345)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -289,6 +297,9 @@ def train():
     if is_main and args.wandb_mode != "disabled":
         mode = "disabled" if args.wandb_mode == "disabled" else args.wandb_mode
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name, config=vars(args), mode=mode)
+
+    # Pre-parse sample prompts
+    sample_prompts = [s.strip() for s in args.sample_prompts.split("|||") if s.strip()]
     pipe.text_encoder_2.hidden_proj.train()
     pipe.text_encoder_2.pool_proj.train()
     unet.train()
@@ -357,6 +368,23 @@ def train():
                     "train/loss": float(loss.detach().cpu()),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/step_time_s": time.time() - t0,
+                    "global_step": step,
+                }, step=step)
+
+            # Periodically log sample images
+            if is_main and args.wandb_mode != "disabled" and args.log_images_every > 0 and step % args.log_images_every == 0:
+                with torch.no_grad():
+                    g = torch.Generator(device=device).manual_seed(args.sample_seed)
+                    images = pipe(
+                        prompt=sample_prompts,
+                        num_inference_steps=args.sample_steps,
+                        guidance_scale=args.guidance_scale,
+                        height=args.sample_height,
+                        width=args.sample_width,
+                        generator=g,
+                    ).images
+                wandb.log({
+                    "samples/images": [wandb.Image(img, caption=sample_prompts[i]) for i, img in enumerate(images)],
                     "global_step": step,
                 }, step=step)
 
