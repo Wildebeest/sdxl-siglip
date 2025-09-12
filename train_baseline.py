@@ -616,7 +616,11 @@ def train():
         except Exception as e:
             accelerator.print(f"Warning: failed to sample training examples for logging: {e}")
     pipe.text_encoder_2.hidden_proj.train()
-    pipe.text_encoder_2.pool_proj.train()
+    if hasattr(pipe.text_encoder_2, 'pool_proj'):
+        pipe.text_encoder_2.pool_proj.train()
+    else:
+        pipe.text_encoder_2.pool_proj_1.train()
+        pipe.text_encoder_2.pool_proj_2.train()
     unet.train()
 
     # B2 setup (main process only)
