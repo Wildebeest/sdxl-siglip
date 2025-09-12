@@ -2,7 +2,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,8 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer
 import wandb
+from torchvision import transforms
+from torchvision.transforms.functional import to_pil_image
 
 
 # Optional but commonly available in Transformers >=4.38
@@ -171,17 +173,8 @@ def add_noise(latents: torch.Tensor, noise_scheduler, noise: Optional[torch.Tens
     return noisy_latents, noise, timesteps
 
 
-def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key: str = "jpg", text_key: str = "txt"):
-    import webdataset as wds
-    from torchvision import transforms
-    from PIL import Image
-
-    def decode_img(x):
-        with Image.open(x) as im:
-            im = im.convert("RGB")
-            return im
-
-    transform = transforms.Compose(
+def build_train_transform() -> transforms.Compose:
+    return transforms.Compose(
         [
             transforms.Resize(1024, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(1024),
@@ -189,6 +182,18 @@ def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key:
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ]
     )
+
+
+def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key: str = "jpg", text_key: str = "txt"):
+    import webdataset as wds
+    from PIL import Image
+
+    def decode_img(x):
+        with Image.open(x) as im:
+            im = im.convert("RGB")
+            return im
+
+    transform = build_train_transform()
 
     dataset = (
         wds.WebDataset(urls, handler=wds.ignore_and_continue)
@@ -206,6 +211,39 @@ def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key:
     )
 
     return wds.WebLoader(loader, batch_size=None, num_workers=num_workers)
+
+
+def tensor_to_pil(x: torch.Tensor) -> "Image.Image":
+    x = x.detach().cpu().clamp(-1, 1)
+    x = (x * 0.5 + 0.5).clamp(0, 1)
+    return to_pil_image(x)
+
+
+def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: str = "jpg", text_key: str = "txt") -> List[Dict[str, object]]:
+    import webdataset as wds
+    from PIL import Image
+
+    def decode_img(x):
+        with Image.open(x) as im:
+            im = im.convert("RGB")
+            return im
+
+    rng = torch.Generator().manual_seed(seed)
+    transform = build_train_transform()
+    ds = (
+        wds.WebDataset(urls, handler=wds.ignore_and_continue)
+        .shuffle(1000, rng=rng)
+        .decode()
+        .to_tuple(image_key, text_key)
+        .map_tuple(lambda img: transform(decode_img(img)), lambda txt: txt.decode("utf-8") if isinstance(txt, (bytes, bytearray)) else str(txt))
+    )
+
+    out: List[Dict[str, object]] = []
+    for img_t, txt in ds:
+        out.append({"prompt": txt, "train_img": tensor_to_pil(img_t)})
+        if len(out) >= n:
+            break
+    return out
 
 
 def save_adapter(adapter: SiglipAsTextEncoder, out_dir: str):
@@ -229,6 +267,8 @@ def train():
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--image_key", type=str, default="jpg")
+    parser.add_argument("--text_key", type=str, default="txt")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"]) 
     parser.add_argument("--guidance_scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -239,8 +279,8 @@ def train():
     parser.add_argument("--wandb_mode", type=str, default=os.environ.get("WANDB_MODE", "online"), choices=["online", "offline", "disabled"]) 
     # image logging options
     parser.add_argument("--log_images_every", type=int, default=200, help="Log sample images to W&B every N steps; 0 disables")
-    parser.add_argument("--sample_prompts", type=str, default="a corgi wearing sunglasses|||a cinematic portrait, 85mm, shallow depth of field|||a sleek red sports car driving at night, rain, reflections",
-                        help="Prompts separated by '|||' for periodic image logging")
+    parser.add_argument("--sample_from_data_n", type=int, default=4, help="Number of (image,prompt) samples to draw from training set for logging")
+    parser.add_argument("--sample_from_data_seed", type=int, default=12345)
     parser.add_argument("--sample_steps", type=int, default=20)
     parser.add_argument("--sample_height", type=int, default=768)
     parser.add_argument("--sample_width", type=int, default=768)
@@ -288,7 +328,13 @@ def train():
 
     # Data
     assert args.train_urls, "--train_urls must point to WebDataset shards"
-    loader = make_wds_loader(args.train_urls, batch_size=args.batch_size, num_workers=args.num_workers)
+    loader = make_wds_loader(
+        args.train_urls,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_key=args.image_key,
+        text_key=args.text_key,
+    )
 
     unet, vae, optimizer = accelerator.prepare(unet, vae, optimizer)
 
@@ -298,8 +344,24 @@ def train():
         mode = "disabled" if args.wandb_mode == "disabled" else args.wandb_mode
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name, config=vars(args), mode=mode)
 
-    # Pre-parse sample prompts
-    sample_prompts = [s.strip() for s in args.sample_prompts.split("|||") if s.strip()]
+    # Draw a small fixed set of (prompt, training image) pairs from the dataset for logging comparisons
+    compare_pairs: List[Dict[str, object]] = []
+    if is_main and args.wandb_mode != "disabled" and args.log_images_every > 0:
+        try:
+            compare_pairs = sample_training_examples(
+                args.train_urls,
+                n=args.sample_from_data_n,
+                seed=args.sample_from_data_seed,
+                image_key=args.image_key,
+                text_key=args.text_key,
+            )
+            # Log the raw training examples at step 0
+            tbl = wandb.Table(columns=["prompt", "training_image"])
+            for ex in compare_pairs:
+                tbl.add_data(ex["prompt"], wandb.Image(ex["train_img"]))
+            wandb.log({"samples/training_examples": tbl, "global_step": 0}, step=0)
+        except Exception as e:
+            accelerator.print(f"Warning: failed to sample training examples for logging: {e}")
     pipe.text_encoder_2.hidden_proj.train()
     pipe.text_encoder_2.pool_proj.train()
     unet.train()
@@ -372,21 +434,22 @@ def train():
                 }, step=step)
 
             # Periodically log sample images
-            if is_main and args.wandb_mode != "disabled" and args.log_images_every > 0 and step % args.log_images_every == 0:
+            if is_main and args.wandb_mode != "disabled" and args.log_images_every > 0 and step % args.log_images_every == 0 and compare_pairs:
+                prompts = [str(ex["prompt"]) for ex in compare_pairs]
                 with torch.no_grad():
                     g = torch.Generator(device=device).manual_seed(args.sample_seed)
-                    images = pipe(
-                        prompt=sample_prompts,
+                    gen_images = pipe(
+                        prompt=prompts,
                         num_inference_steps=args.sample_steps,
                         guidance_scale=args.guidance_scale,
                         height=args.sample_height,
                         width=args.sample_width,
                         generator=g,
                     ).images
-                wandb.log({
-                    "samples/images": [wandb.Image(img, caption=sample_prompts[i]) for i, img in enumerate(images)],
-                    "global_step": step,
-                }, step=step)
+                tbl = wandb.Table(columns=["prompt", "training_image", "generated_image"])
+                for ex, gi in zip(compare_pairs, gen_images):
+                    tbl.add_data(ex["prompt"], wandb.Image(ex["train_img"]), wandb.Image(gi))
+                wandb.log({"samples/compare": tbl, "global_step": step}, step=step)
 
         if accelerator.is_main_process and step % 50 == 0:
             accelerator.print(f"step {step}: loss={loss.item():.4f}")
