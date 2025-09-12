@@ -158,8 +158,9 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
+ARGS='"$EXTRA_ARGS"'
 set +o braceexpand; set -o noglob
-nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"' > "$log" 2>&1 || nohup uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"' > "$log" 2>&1 &
+nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 || nohup uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 &
 echo $! > train.pid
 echo "Started PID $(cat train.pid)"
 echo "$log"
@@ -176,8 +177,9 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
+ARGS='"$EXTRA_ARGS"'
 set +o braceexpand; set -o noglob
-"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"' || uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"'
+"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS || uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS
 '
   $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG"
   echo "Remote training finished."

@@ -212,7 +212,11 @@ def swap_text_encoder_2_for_siglip(
     # concatenation of TE1+TE2 pooled dims expected by SDXL's UNet add_embedding.
     # That is typically 2 * orig_te2.projection_dim.
     if single_encoder:
-        target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden)) * 2
+        # In single-encoder mode, we produce a pooled embedding that occupies the
+        # text-encoder-2 slot (1280 for SDXL base). SDXL's add-embedding layer expects
+        # a total input of 2816 = 1280 (TE1) + 1280 (TE2) + 256 (time ids). The missing
+        # TE1 portion is handled by the pipeline's _get_add_time_ids helper.
+        target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
     else:
         target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
 
@@ -294,7 +298,9 @@ def encode_text(pipe: StableDiffusionXLPipeline, prompts, device, guidance_scale
 
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
-    # Default SDXL path
+    # No dual-encoder path: we are in single-encoder mode only.
+
+    # Fallback to the pipeline's default
     return pipe.encode_prompt(
         prompts,
         device=device,
@@ -518,8 +524,9 @@ def train():
 
     # Replace CLIP-2 with SigLIP + linear projections
     if not args.no_siglip:
-        # Single-encoder mode: remove TE1/TE2 and feed UNet with SigLIP projected to cross_attention_dim,
-        # with sequence resampled to 77 tokens.
+        # Single-encoder mode: remove TE1/TE2 and feed UNet with SigLIP projected
+        # directly to the UNet cross-attention dim, with pooled embedding sized
+        # to match SDXL's expected addition embedding input.
         pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
 
     # Hard-freeze: UNet and VAE params (saves memory/compute)
