@@ -70,7 +70,11 @@ class SiglipAsTextEncoder(nn.Module):
         in_proj = getattr(self.model.config, "projection_dim", in_hidden)
 
         self.hidden_proj = nn.Linear(in_hidden, target_hidden_size)
+        self.hidden_ln = nn.LayerNorm(target_hidden_size)
         self.pool_proj = nn.Linear(in_proj, target_proj_dim)
+
+        # Lightweight learnable resampler: learnable queries attend over token sequence
+        self.resampler = TokenResampler(d_model=target_hidden_size, target_len=self.target_seq_len, num_heads=4)
 
         # Minimal config shim used by SDXL to read `projection_dim`
         @dataclass
@@ -94,13 +98,9 @@ class SiglipAsTextEncoder(nn.Module):
             penultimate = out.last_hidden_state
 
         seq_feats = self.hidden_proj(penultimate)
-        # Resample sequence length to the fixed target using 1D interpolation
-        # Works for both downsampling (>77) and upsampling (<77)
-        b, l, h = seq_feats.shape
-        if l != self.target_seq_len:
-            seq_feats = F.interpolate(
-                seq_feats.transpose(1, 2), size=self.target_seq_len, mode="linear", align_corners=False
-            ).transpose(1, 2)
+        seq_feats = self.hidden_ln(seq_feats)
+        # Learnable resampling to exactly target_seq_len tokens
+        seq_feats = self.resampler(seq_feats)
 
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
@@ -124,6 +124,49 @@ class SiglipAsTextEncoder(nn.Module):
             return next(self.parameters()).device
         except StopIteration:
             return torch.device("cpu")
+
+
+class TokenResampler(nn.Module):
+    """Learnable token resampler using cross-attention from T learnable queries.
+
+    Inputs:  x [B, L, D]
+    Outputs: y [B, T, D]  where T = target_len
+    """
+    def __init__(self, d_model: int, target_len: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.target_len = int(target_len)
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.scale = (d_model // num_heads) ** -0.5
+        self.queries = nn.Parameter(torch.randn(self.target_len, d_model) * 0.02)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D]
+        b, l, d = x.shape
+        q = self.ln_q(self.queries).unsqueeze(0).expand(b, -1, -1)  # [B, T, D]
+        k = self.k_proj(self.ln_kv(x))      # [B, L, D]
+        v = self.v_proj(self.ln_kv(x))      # [B, L, D]
+
+        # reshape to multi-head: [B, H, T, Dh], [B, H, L, Dh]
+        h = self.num_heads
+        dh = d // h
+        q = q.view(b, self.target_len, h, dh).transpose(1, 2)  # [B,H,T,Dh]
+        k = k.view(b, l, h, dh).transpose(1, 2)                # [B,H,L,Dh]
+        v = v.view(b, l, h, dh).transpose(1, 2)                # [B,H,L,Dh]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale          # [B,H,T,L]
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        y = attn @ v                                           # [B,H,T,Dh]
+        y = y.transpose(1, 2).contiguous().view(b, self.target_len, d)  # [B,T,D]
+        y = self.out_proj(y)
+        return y
 
 
 def swap_text_encoder_2_for_siglip(
@@ -396,7 +439,7 @@ def train():
         help="WebDataset shard pattern (default: 47 shards from 000000..000046 on Backblaze B2)",
     )
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -464,7 +507,10 @@ def train():
     else:
         # Fallback: no-op tiny parameter to keep optimizer valid (should not be used in SigLIP mode)
         params = list(pipe.unet.parameters())[:0]
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
+    optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.99), weight_decay=1e-4)
+    # Scheduler: cosine with warmup
+    warmup = max(10, min(500, args.max_steps // 10))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup, num_training_steps=args.max_steps)
 
     # Use the pipeline's scheduler/vae/unet directly
     noise_scheduler = pipe.scheduler
@@ -583,7 +629,9 @@ def train():
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
             accelerator.backward(loss)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             # Update EMA of step time
             dt = time.time() - t0
