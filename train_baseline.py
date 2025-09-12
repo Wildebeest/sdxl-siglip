@@ -801,7 +801,6 @@ def train():
                 (0, 0),
                 (1024, 1024),
                 dtype=unet.dtype,
-                text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
             )
             add_time_ids = add_time_ids.to(device)
 
