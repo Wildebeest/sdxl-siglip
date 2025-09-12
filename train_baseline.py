@@ -60,7 +60,7 @@ class SiglipAsTextEncoder(nn.Module):
     - Exposes a minimal `.config` containing `projection_dim`.
     """
 
-    def __init__(self, siglip_model_id: str, target_hidden_size: int, target_proj_dim: int, target_seq_len: int = 77):
+    def __init__(self, siglip_model_id: str, target_hidden_size: int, target_proj_dim: int, target_seq_len: int = 77, double_pooled: bool = False):
         super().__init__()
         if SiglipTextModel is None:
             raise ImportError("Transformers does not provide SiglipTextModel in this environment.")
@@ -73,7 +73,12 @@ class SiglipAsTextEncoder(nn.Module):
 
         self.hidden_proj = nn.Linear(in_hidden, target_hidden_size)
         self.hidden_ln = nn.LayerNorm(target_hidden_size)
-        self.pool_proj = nn.Linear(in_proj, target_proj_dim)
+        self.double_pooled = bool(double_pooled)
+        if self.double_pooled:
+            self.pool_proj_1 = nn.Linear(in_proj, target_proj_dim)
+            self.pool_proj_2 = nn.Linear(in_proj, target_proj_dim)
+        else:
+            self.pool_proj = nn.Linear(in_proj, target_proj_dim)
 
         # Lightweight learnable resampler: learnable queries attend over token sequence
         self.resampler = TokenResampler(d_model=target_hidden_size, target_len=self.target_seq_len, num_heads=4)
@@ -114,7 +119,10 @@ class SiglipAsTextEncoder(nn.Module):
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
             pooled = out.last_hidden_state[:, 0]
-        pooled = self.pool_proj(pooled)
+        if self.double_pooled:
+            pooled = torch.cat([self.pool_proj_1(pooled), self.pool_proj_2(pooled)], dim=-1)
+        else:
+            pooled = self.pool_proj(pooled)
 
         # Construct a tuple where [-2] works reliably
         hs: Tuple[torch.Tensor, ...] = (seq_feats, torch.empty(0, device=seq_feats.device))
@@ -224,7 +232,13 @@ def swap_text_encoder_2_for_siglip(
     tokenizer_2 = AutoTokenizer.from_pretrained(siglip_id, use_fast=True)
 
     target_seq_len = int(getattr(pipe.tokenizer, "model_max_length", 77) or 77)
-    adapter = SiglipAsTextEncoder(siglip_id, target_hidden_size=target_hidden, target_proj_dim=target_proj, target_seq_len=target_seq_len)
+    adapter = SiglipAsTextEncoder(
+        siglip_id,
+        target_hidden_size=target_hidden,
+        target_proj_dim=target_proj,
+        target_seq_len=target_seq_len,
+        double_pooled=single_encoder,
+    )
     # Align tokenizer_2 max length with SigLIP's capacity to avoid 77 vs 64 mismatch
     try:
         siglip_max = int(getattr(adapter.model.config, "max_position_embeddings", tokenizer_2.model_max_length))
@@ -774,17 +788,12 @@ def train():
                 (0, 0),
                 (1024, 1024),
                 dtype=unet.dtype,
-                text_encoder_projection_dim=target_text_dim,
+                text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
             )
             add_time_ids = add_time_ids.to(device)
 
-            # Ensure pooled text embedding matches TE1+TE2 pooled dim by duplicating if needed
-            if int(pooled_prompt_embeds.shape[-1]) != target_text_dim:
-                add_text_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=-1)
-                if negative_pooled_prompt_embeds is not None:
-                    negative_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds], dim=-1)
-            else:
-                add_text_embeds = pooled_prompt_embeds
+            # Adapter now outputs 2x projection_dim in single-encoder mode; pass through as-is
+            add_text_embeds = pooled_prompt_embeds
 
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
                 try:
