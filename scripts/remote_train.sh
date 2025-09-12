@@ -107,12 +107,16 @@ $SSH_CMD "$HOST" bash -lc 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 if [[ "$BACKGROUND" -eq 1 ]]; then
   echo "[4/5] Starting background training with nohup..."
-  START_BG='set -euo pipefail
+START_BG='set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 cd '"$REMOTE_DIR"'
 ts=$(date +%Y%m%d_%H%M%S)
 log="train_${ts}.log"
 echo "Logging to $log"
+set +o allexport
+if [ -f .env ]; then
+  set -o allexport; . ./.env; set +o allexport
+fi
 nohup uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"' > "$log" 2>&1 &
 echo $! > train.pid
 echo "Started PID $(cat train.pid)"
@@ -123,12 +127,15 @@ echo "$log"
   echo "$SSH_CMD $HOST bash -lc 'cd $REMOTE_DIR; tail -f $LOGFILE'"
 else
   echo "[4/5] Starting foreground training (attached)..."
-  START_FG='set -euo pipefail
+START_FG='set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 cd '"$REMOTE_DIR"'
+set +o allexport
+if [ -f .env ]; then
+  set -o allexport; . ./.env; set +o allexport
+fi
 uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' '"$EXTRA_ARGS"'
 '
   $SSH_CMD "$HOST" bash -lc "$START_FG"
   echo "[5/5] Remote training finished."
 fi
-

@@ -18,6 +18,13 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer
 import wandb
+
+# Optional: Backblaze B2 SDK for checkpoint uploads
+try:
+    from b2sdk.v2 import InMemoryAccountInfo, B2Api
+except Exception:  # pragma: no cover
+    InMemoryAccountInfo = None  # type: ignore
+    B2Api = None  # type: ignore
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 
@@ -246,14 +253,48 @@ def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: st
     return out
 
 
-def save_adapter(adapter: SiglipAsTextEncoder, out_dir: str):
+def save_adapter(adapter: SiglipAsTextEncoder, out_dir: str, filename: str = "siglip_adapter.pt"):
     os.makedirs(out_dir, exist_ok=True)
     torch.save({
         "hidden_proj": adapter.hidden_proj.state_dict(),
         "pool_proj": adapter.pool_proj.state_dict(),
         "siglip_config": adapter.model.config.to_dict(),
         "projection_dim": adapter.config.projection_dim,
-    }, os.path.join(out_dir, "siglip_adapter.pt"))
+    }, os.path.join(out_dir, filename))
+
+
+def maybe_init_b2(bucket_name: str, prefix: Optional[str] = None):
+    key_id = os.environ.get("B2_KEY_ID") or os.environ.get("B2_APPLICATION_KEY_ID")
+    app_key = os.environ.get("B2_APPLICATION_KEY")
+    if not key_id or not app_key or B2Api is None or InMemoryAccountInfo is None:
+        return None, None
+
+    info = InMemoryAccountInfo()
+    api = B2Api(info)
+    try:
+        api.authorize_account("production", key_id, app_key)
+        bucket = api.get_bucket_by_name(bucket_name)
+    except Exception as e:  # pragma: no cover
+        print(f"Warning: B2 init failed ({e}); disabling uploads.")
+        return None, None
+
+    if prefix is None:
+        run_tag = None
+        if wandb.run is not None:
+            run_tag = f"{wandb.run.project}-{wandb.run.id}"
+        if run_tag is None:
+            run_tag = time.strftime("%Y%m%d_%H%M%S")
+        prefix = f"checkpoints/{run_tag}"
+    return bucket, prefix
+
+
+def b2_upload(bucket, local_path: str, remote_key: str):
+    try:
+        bucket.upload_local_file(local_file=local_path, file_name=remote_key)
+        return True
+    except Exception as e:  # pragma: no cover
+        print(f"Warning: B2 upload failed for {local_path} -> {remote_key}: {e}")
+        return False
 
 
 def train():
@@ -290,6 +331,10 @@ def train():
     parser.add_argument("--sample_height", type=int, default=768)
     parser.add_argument("--sample_width", type=int, default=768)
     parser.add_argument("--sample_seed", type=int, default=12345)
+    # checkpointing / backups
+    parser.add_argument("--save_every", type=int, default=1000, help="Save adapter checkpoint every N steps; 0 to disable periodic saves")
+    parser.add_argument("--b2_bucket", type=str, default=os.environ.get("B2_BUCKET", "sdxl-siglip"))
+    parser.add_argument("--b2_prefix", type=str, default=os.environ.get("B2_PREFIX"))
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -371,6 +416,12 @@ def train():
     pipe.text_encoder_2.pool_proj.train()
     unet.train()
 
+    # B2 setup (main process only)
+    b2_bucket = None
+    b2_prefix = None
+    if is_main:
+        b2_bucket, b2_prefix = maybe_init_b2(args.b2_bucket, args.b2_prefix)
+
     for batch in loader:
         if step >= args.max_steps:
             break
@@ -438,6 +489,15 @@ def train():
                     "global_step": step,
                 }, step=step)
 
+            # Periodic local save + optional B2 upload
+            if is_main and args.save_every > 0 and step > 0 and step % args.save_every == 0:
+                ckpt_dir = os.path.join(args.output_dir, "adapter")
+                fname = f"siglip_adapter_step{step}.pt"
+                save_adapter(pipe.text_encoder_2, ckpt_dir, filename=fname)
+                if b2_bucket is not None:
+                    rel_key = f"{b2_prefix}/{fname}"
+                    b2_upload(b2_bucket, os.path.join(ckpt_dir, fname), rel_key)
+
             # Periodically log sample images
             if is_main and args.wandb_mode != "disabled" and args.log_images_every > 0 and step % args.log_images_every == 0 and compare_pairs:
                 prompts = [str(ex["prompt"]) for ex in compare_pairs]
@@ -462,7 +522,13 @@ def train():
         step += 1
 
     if accelerator.is_main_process:
-        save_adapter(pipe.text_encoder_2, os.path.join(args.output_dir, "adapter"))
+        # Final save
+        ckpt_dir = os.path.join(args.output_dir, "adapter")
+        final_name = "siglip_adapter.pt"
+        save_adapter(pipe.text_encoder_2, ckpt_dir, filename=final_name)
+        # Upload final
+        if b2_bucket is not None:
+            b2_upload(b2_bucket, os.path.join(ckpt_dir, final_name), f"{b2_prefix}/{final_name}")
         if args.wandb_mode != "disabled":
             wandb.save(os.path.join(args.output_dir, "adapter", "siglip_adapter.pt"))
             wandb.finish()
