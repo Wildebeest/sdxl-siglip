@@ -6,12 +6,15 @@ set -euo pipefail
 
 usage() {
   cat << 'USAGE'
-Usage: scripts/remote_kill.sh --host user@host [--remote-dir "~/sdxl-siglip"] [--ssh "ssh -p 22"] [--grace 10] [--force]
+Usage: scripts/remote_kill.sh --host user@host [--remote-dir "~/sdxl-siglip"] [--ssh "ssh -p 22"] \
+       [--accept-new-hostkey] [--no-accept-new-hostkey] [--grace 10] [--force]
 
 Options:
   --host         SSH target (required)
   --remote-dir   Remote repo dir (default: ~/sdxl-siglip)
   --ssh          SSH command (default: ssh)
+  --accept-new-hostkey    Auto-accept new host keys (default)
+  --no-accept-new-hostkey Disable auto-accept; use strict hostkey checks
   --grace        Seconds to wait after SIGTERM before SIGKILL (default: 10)
   --force        Send SIGKILL immediately after SIGTERM attempt
 USAGE
@@ -22,12 +25,16 @@ REMOTE_DIR="~/sdxl-siglip"
 SSH_CMD="ssh"
 GRACE=10
 FORCE=0
+SSH_OPTS=()
+ACCEPT_NEW=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) HOST="$2"; shift 2;;
     --remote-dir) REMOTE_DIR="$2"; shift 2;;
     --ssh) SSH_CMD="$2"; shift 2;;
+    --accept-new-hostkey) ACCEPT_NEW=1; shift;;
+    --no-accept-new-hostkey) ACCEPT_NEW=0; shift;;
     --grace) GRACE="$2"; shift 2;;
     --force) FORCE=1; shift;;
     -h|--help) usage; exit 0;;
@@ -39,6 +46,11 @@ if [[ -z "$HOST" ]]; then
   echo "Error: --host is required" >&2
   usage
   exit 2
+fi
+
+# Configure SSH options
+if [[ $ACCEPT_NEW -eq 1 ]]; then
+  SSH_OPTS+=( -o StrictHostKeyChecking=accept-new -o UpdateHostKeys=yes )
 fi
 
 REMOTE_CMD='set -euo pipefail
@@ -91,5 +103,4 @@ echo "Remaining training-like PIDs (if any):"
 pgrep -fa "train_baseline.py" || true
 '
 
-$SSH_CMD "$HOST" bash -lc "$REMOTE_CMD"
-
+$SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$REMOTE_CMD"

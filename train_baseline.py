@@ -58,12 +58,13 @@ class SiglipAsTextEncoder(nn.Module):
     - Exposes a minimal `.config` containing `projection_dim`.
     """
 
-    def __init__(self, siglip_model_id: str, target_hidden_size: int, target_proj_dim: int):
+    def __init__(self, siglip_model_id: str, target_hidden_size: int, target_proj_dim: int, target_seq_len: int = 77):
         super().__init__()
         if SiglipTextModel is None:
             raise ImportError("Transformers does not provide SiglipTextModel in this environment.")
 
         self.model = SiglipTextModel.from_pretrained(siglip_model_id)
+        self.target_seq_len = int(target_seq_len)
 
         in_hidden = getattr(self.model.config, "hidden_size")
         in_proj = getattr(self.model.config, "projection_dim", in_hidden)
@@ -93,6 +94,14 @@ class SiglipAsTextEncoder(nn.Module):
             penultimate = out.last_hidden_state
 
         seq_feats = self.hidden_proj(penultimate)
+        # Ensure sequence length matches what SDXL expects (typically 77)
+        b, l, h = seq_feats.shape
+        tsl = self.target_seq_len
+        if l < tsl:
+            pad = torch.zeros((b, tsl - l, h), device=seq_feats.device, dtype=seq_feats.dtype)
+            seq_feats = torch.cat([seq_feats, pad], dim=1)
+        elif l > tsl:
+            seq_feats = seq_feats[:, :tsl]
 
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
@@ -102,6 +111,20 @@ class SiglipAsTextEncoder(nn.Module):
         # Construct a tuple where [-2] works reliably
         hs: Tuple[torch.Tensor, ...] = (torch.empty(0, device=seq_feats.device), seq_feats)
         return _AdapterOutput(pooled, hs)
+
+    @property
+    def dtype(self):
+        try:
+            return next(self.parameters()).dtype
+        except StopIteration:
+            return torch.get_default_dtype()
+
+    @property
+    def device(self):
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
 
 
 def swap_text_encoder_2_for_siglip(
@@ -133,17 +156,30 @@ def swap_text_encoder_2_for_siglip(
 
     target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
 
-    # Create SigLIP tokenizer and match sequence length with the remaining tokenizer
+    # Create SigLIP tokenizer (max length set after model init)
     tokenizer_2 = AutoTokenizer.from_pretrained(siglip_id, use_fast=True)
-    # Ensure matching sequence length with the other tokenizer if present
-    if pipe.tokenizer is not None and hasattr(pipe.tokenizer, "model_max_length"):
-        tokenizer_2.model_max_length = int(pipe.tokenizer.model_max_length)
 
-    adapter = SiglipAsTextEncoder(siglip_id, target_hidden_size=target_hidden, target_proj_dim=target_proj)
+    target_seq_len = int(getattr(pipe.tokenizer, "model_max_length", 77) or 77)
+    adapter = SiglipAsTextEncoder(siglip_id, target_hidden_size=target_hidden, target_proj_dim=target_proj, target_seq_len=target_seq_len)
+    # Align tokenizer_2 max length with SigLIP's capacity to avoid 77 vs 64 mismatch
+    try:
+        siglip_max = int(getattr(adapter.model.config, "max_position_embeddings", tokenizer_2.model_max_length))
+        tokenizer_2.model_max_length = siglip_max
+        # Also cap tokenizer_1 to the smallest max to keep pair lengths aligned
+        if pipe.tokenizer is not None and hasattr(pipe.tokenizer, "model_max_length"):
+            pipe.tokenizer.model_max_length = int(min(int(pipe.tokenizer.model_max_length), siglip_max))
+    except Exception:
+        pass
 
     if freeze_siglip:
         for p in adapter.model.parameters():
             p.requires_grad = False
+
+    # Move adapter to the same device as UNet (pipeline primary device)
+    try:
+        adapter = adapter.to(getattr(pipe.unet, "device", next(pipe.unet.parameters()).device))
+    except Exception:
+        adapter = adapter.to("cuda" if torch.cuda.is_available() else "cpu")
 
     pipe.tokenizer_2 = tokenizer_2
     pipe.text_encoder_2 = adapter
@@ -192,19 +228,28 @@ def build_train_transform() -> transforms.Compose:
 
 
 def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key: str = "jpg", text_key: str = "txt"):
+    import io
     import webdataset as wds
-    from PIL import Image
+    from PIL import Image, ImageFile
+
+    # Be tolerant of truncated images
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
     def decode_img(x):
-        with Image.open(x) as im:
-            im = im.convert("RGB")
-            return im
+        # x can be PIL.Image, bytes, file-like, or a path; normalize to PIL RGB
+        if isinstance(x, Image.Image):
+            im = x
+        else:
+            buf = io.BytesIO(x) if isinstance(x, (bytes, bytearray, memoryview)) else x
+            with Image.open(buf) as im2:
+                im = im2.copy()
+        return im.convert("RGB")
 
     transform = build_train_transform()
 
     dataset = (
         wds.WebDataset(urls, handler=wds.ignore_and_continue)
-        .decode()
+        .decode("pil")
         .to_tuple(image_key, text_key)
         .map_tuple(lambda img: transform(decode_img(img)), lambda txt: txt.decode("utf-8") if isinstance(txt, (bytes, bytearray)) else str(txt))
     )
@@ -214,7 +259,6 @@ def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key:
         .shuffle(1000)
         .batched(batch_size, partial=False)
         .with_length(10**9)  # virtually infinite
-        .to_tuple("jpg", "txt")  # for type hints only
     )
 
     return wds.WebLoader(loader, batch_size=None, num_workers=num_workers)
@@ -227,20 +271,27 @@ def tensor_to_pil(x: torch.Tensor) -> "Image.Image":
 
 
 def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: str = "jpg", text_key: str = "txt") -> List[Dict[str, object]]:
+    import io
     import webdataset as wds
-    from PIL import Image
+    from PIL import Image, ImageFile
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
     def decode_img(x):
-        with Image.open(x) as im:
-            im = im.convert("RGB")
-            return im
+        if isinstance(x, Image.Image):
+            im = x
+        else:
+            buf = io.BytesIO(x) if isinstance(x, (bytes, bytearray, memoryview)) else x
+            with Image.open(buf) as im2:
+                im = im2.copy()
+        return im.convert("RGB")
 
     rng = torch.Generator().manual_seed(seed)
     transform = build_train_transform()
     ds = (
         wds.WebDataset(urls, handler=wds.ignore_and_continue)
         .shuffle(1000, rng=rng)
-        .decode()
+        .decode("pil")
         .to_tuple(image_key, text_key)
         .map_tuple(lambda img: transform(decode_img(img)), lambda txt: txt.decode("utf-8") if isinstance(txt, (bytes, bytearray)) else str(txt))
     )
@@ -335,6 +386,7 @@ def train():
     parser.add_argument("--save_every", type=int, default=1000, help="Save adapter checkpoint every N steps; 0 to disable periodic saves")
     parser.add_argument("--b2_bucket", type=str, default=os.environ.get("B2_BUCKET", "sdxl-siglip"))
     parser.add_argument("--b2_prefix", type=str, default=os.environ.get("B2_PREFIX"))
+    parser.add_argument("--no_siglip", action="store_true", help="Disable SigLIP swap; train baseline SDXL text encoders")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -354,7 +406,8 @@ def train():
     ).to(device)
 
     # Replace CLIP-2 with SigLIP + linear projections
-    pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=True)
+    if not args.no_siglip:
+        pipe = swap_text_encoder_2_for_siglip(pipe, args.siglip_model, freeze_siglip=True, single_encoder=False)
 
     # Hard-freeze: UNet and VAE params (saves memory/compute)
     for p in pipe.unet.parameters():
