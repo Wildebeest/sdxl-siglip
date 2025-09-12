@@ -484,6 +484,14 @@ def train():
     parser.add_argument("--no_siglip", action="store_true", help="Disable SigLIP swap; train baseline SDXL text encoders")
     parser.add_argument("--safe_start_steps", type=int, default=50, help="Run first N steps with autocast disabled for extra numerical safety")
     parser.add_argument("--debug_log", action="store_true", help="Print debug stats (embeddings/noise preds/grad norms) periodically")
+    # Auto bf16 switching
+    parser.add_argument("--auto_bf16", action="store_true", help="Automatically enable bf16 autocast after stability criteria are met (effective when mixed_precision is 'no' or 'fp16')")
+    parser.add_argument("--auto_bf16_k", type=int, default=10, help="Consecutive ok steps required before enabling bf16")
+    parser.add_argument("--auto_bf16_loss_rel", type=float, default=0.5, help="Max relative change in loss EMA over window to consider stable")
+    parser.add_argument("--auto_bf16_grad_ema", type=float, default=200.0, help="Max grad-norm EMA to consider stable")
+    parser.add_argument("--auto_bf16_noise_std_lo", type=float, default=0.3, help="Lower bound for noise_pred std")
+    parser.add_argument("--auto_bf16_noise_std_hi", type=float, default=3.0, help="Upper bound for noise_pred std")
+    parser.add_argument("--auto_bf16_backoff", type=int, default=3, help="Consecutive bad steps to disable bf16 and return to FP32")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -585,6 +593,15 @@ def train():
     start_time = time.time()
     step_time_ema = None  # exponential moving average of step time
 
+    # Auto-bf16 tracking
+    auto_bf16_active = False
+    ok_count = 0
+    bad_count = 0
+    loss_ema = None
+    grad_ema = None
+    noise_pred_std_ema = None
+    prompt_std_ema = None
+
     for batch in loader:
         if step >= args.max_steps:
             break
@@ -597,7 +614,16 @@ def train():
 
             use_fp32 = step < args.safe_start_steps
             # Latents (no grad for VAE encode) in safe-start precision
-            amp_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
+            # Determine autocast dtype per-step (auto-bf16 can force bfloat16 even when mixed_precision=='no')
+            amp_dtype = None
+            if not use_fp32:
+                if args.auto_bf16 and auto_bf16_active:
+                    amp_dtype = torch.bfloat16
+                elif accelerator.mixed_precision == "bf16":
+                    amp_dtype = torch.bfloat16
+                elif accelerator.mixed_precision == "fp16":
+                    amp_dtype = torch.float16
+            amp_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype is not None))
             if use_fp32:
                 # Force VAE encode path to float32 to avoid fp16 instability
                 with torch.no_grad():
@@ -703,7 +729,10 @@ def train():
                 assert negative_prompt_embeds.dim() == 3, f"neg_prompt_embeds dim {negative_prompt_embeds.shape}"
 
             # Pack added time ids used by SDXL
-            add_text_embeds = pooled_prompt_embeds
+            # SDXL UNet expects concatenated pooled embeds from TE1 and TE2 (each ~1280),
+            # followed by 256-dim time ids -> total in_features ~ 2816.
+            # In SigLIP-only mode, duplicate the pooled embed to fill both slots.
+            add_text_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=-1)
             add_time_ids = pipe._get_add_time_ids(
                 (1024, 1024),
                 (0, 0),
@@ -721,7 +750,7 @@ def train():
                         noisy_latents,
                         timesteps,
                         encoder_hidden_states=negative_prompt_embeds,
-                        added_cond_kwargs={"text_embeds": negative_pooled_prompt_embeds, "time_ids": add_time_ids},
+                        added_cond_kwargs={"text_embeds": torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds], dim=-1), "time_ids": add_time_ids},
                     ).sample
                     noise_pred_text = unet(
                         noisy_latents,
@@ -770,6 +799,56 @@ def train():
                     if p.grad is not None:
                         total_norm += float(p.grad.detach().data.float().norm().item())
                 accelerator.print(f"grad_norm (sum of norms): {total_norm:.6f}")
+
+            # Update stability metrics and decide auto-bf16 transitions
+            try:
+                # Gather stats
+                with torch.no_grad():
+                    np_std = float(noise_pred.detach().float().std(unbiased=False).item())
+                    pe_std = float(prompt_embeds.detach().float().std(unbiased=False).item())
+                    gsum = 0.0
+                    for p in params:
+                        if p.grad is not None:
+                            gsum += float(p.grad.detach().data.float().norm().item())
+                # EMAs
+                alpha = 0.9
+                loss_ema = float(loss.detach().float().item()) if loss_ema is None else (alpha * loss_ema + (1 - alpha) * float(loss.detach().float().item()))
+                grad_ema = gsum if grad_ema is None else (alpha * grad_ema + (1 - alpha) * gsum)
+                noise_pred_std_ema = np_std if noise_pred_std_ema is None else (alpha * noise_pred_std_ema + (1 - alpha) * np_std)
+                prompt_std_ema = pe_std if prompt_std_ema is None else (alpha * prompt_std_ema + (1 - alpha) * pe_std)
+
+                # Conditions
+                loss_ok = torch.isfinite(loss.detach()).all().item()
+                rel_ok = True
+                if loss_ema is not None and loss_ok:
+                    rel = abs(float(loss.detach().float().item()) - loss_ema) / max(abs(loss_ema), 1e-6)
+                    rel_ok = rel <= args.auto_bf16_loss_rel
+                noise_ok = (args.auto_bf16_noise_std_lo <= np_std <= args.auto_bf16_noise_std_hi)
+                prompt_ok = (0.01 <= pe_std <= 0.2)
+                grad_ok = (grad_ema is None) or (grad_ema <= args.auto_bf16_grad_ema)
+                all_ok = bool(loss_ok and rel_ok and noise_ok and prompt_ok and grad_ok)
+
+                if step >= args.safe_start_steps and args.auto_bf16:
+                    if not auto_bf16_active:
+                        ok_count = ok_count + 1 if all_ok else 0
+                        if ok_count >= args.auto_bf16_k:
+                            auto_bf16_active = True
+                            if is_main:
+                                accelerator.print(f"[auto-bf16] Enabling bf16 autocast at step {step} (loss_ema={loss_ema:.4g}, np_std_ema={noise_pred_std_ema:.3g}, grad_ema={grad_ema:.3g})")
+                    else:
+                        # Active: monitor for backoff
+                        if not all_ok or not torch.isfinite(loss.detach()).all():
+                            bad_count += 1
+                            if bad_count >= args.auto_bf16_backoff:
+                                auto_bf16_active = False
+                                ok_count = 0
+                                bad_count = 0
+                                if is_main:
+                                    accelerator.print(f"[auto-bf16] Backing off to FP32 at step {step}; monitoring stability again.")
+                        else:
+                            bad_count = 0
+            except Exception:
+                pass
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
