@@ -75,10 +75,15 @@ class SiglipAsTextEncoder(nn.Module):
         self.hidden_ln = nn.LayerNorm(target_hidden_size)
         self.double_pooled = bool(double_pooled)
         if self.double_pooled:
-            self.pool_proj_1 = nn.Linear(in_proj, target_proj_dim)
-            self.pool_proj_2 = nn.Linear(in_proj, target_proj_dim)
+            # Split target_proj_dim across two heads to sum exactly to target_proj_dim
+            head1 = int(target_proj_dim // 2)
+            head2 = int(target_proj_dim - head1)
+            self.pool_proj_1 = nn.Linear(in_proj, head1)
+            self.pool_proj_2 = nn.Linear(in_proj, head2)
+            self.pool_out_dim = head1 + head2
         else:
             self.pool_proj = nn.Linear(in_proj, target_proj_dim)
+            self.pool_out_dim = int(target_proj_dim)
 
         # Lightweight learnable resampler: learnable queries attend over token sequence
         self.resampler = TokenResampler(d_model=target_hidden_size, target_len=self.target_seq_len, num_heads=4)
@@ -90,7 +95,8 @@ class SiglipAsTextEncoder(nn.Module):
         class _Config:
             projection_dim: int
 
-        self.config = _Config(projection_dim=target_proj_dim)
+        # Expose the pooled output dim that downstream code uses as text projection dim
+        self.config = _Config(projection_dim=int(self.pool_out_dim))
 
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, output_hidden_states: bool = True):
         out = self.model(
@@ -123,7 +129,7 @@ class SiglipAsTextEncoder(nn.Module):
             pooled = torch.cat([self.pool_proj_1(pooled), self.pool_proj_2(pooled)], dim=-1)
         else:
             pooled = self.pool_proj(pooled)
-
+        
         # Construct a tuple where [-2] works reliably
         hs: Tuple[torch.Tensor, ...] = (seq_feats, torch.empty(0, device=seq_feats.device))
         return _AdapterOutput(pooled, hs)
@@ -220,11 +226,18 @@ def swap_text_encoder_2_for_siglip(
     # concatenation of TE1+TE2 pooled dims expected by SDXL's UNet add_embedding.
     # That is typically 2 * orig_te2.projection_dim.
     if single_encoder:
-        # In single-encoder mode, we produce a pooled embedding that occupies the
-        # text-encoder-2 slot (1280 for SDXL base). SDXL's add-embedding layer expects
-        # a total input of 2816 = 1280 (TE1) + 1280 (TE2) + 256 (time ids). The missing
-        # TE1 portion is handled by the pipeline's _get_add_time_ids helper.
-        target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
+        # Compute required pooled text dim from UNet add-embedding and time embedding at runtime
+        unet = pipe.unet
+        in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
+        # SDXL uses 6 geometry scalars; discover actual per-scalar embed dim by calling add_time_proj
+        import torch as _torch
+        device = getattr(unet, 'device', next(unet.parameters()).device)
+        with _torch.no_grad():
+            t = _torch.zeros(6, device=device)
+            time_emb = unet.add_time_proj(t)
+            time_dim = int(time_emb.reshape(1, -1).shape[-1])
+        needed_text_dim = int(in_features - time_dim)
+        target_proj = needed_text_dim
     else:
         target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
 
@@ -237,7 +250,7 @@ def swap_text_encoder_2_for_siglip(
         target_hidden_size=target_hidden,
         target_proj_dim=target_proj,
         target_seq_len=target_seq_len,
-        double_pooled=False,
+        double_pooled=single_encoder,
     )
     # Align tokenizer_2 max length with SigLIP's capacity to avoid 77 vs 64 mismatch
     try:
@@ -805,30 +818,8 @@ def train():
             )
             add_time_ids = add_time_ids.to(device)
 
-            # Fit pooled text embeds to the UNet add-embedding expected text_dim
-            try:
-                in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
-            except Exception:
-                in_features = 2816
-            add_ids_len = int(add_time_ids.shape[-1])
-            time_dim_each = int(getattr(unet.config, 'addition_time_embed_dim', 256))
-            total_time_dim = time_dim_each * add_ids_len
-            needed_text_dim = max(in_features - total_time_dim, 0)
-
-            def fit_text_dim(x: torch.Tensor, needed: int) -> torch.Tensor:
-                cur = int(x.shape[-1])
-                if cur == needed:
-                    return x
-                if 2 * cur == needed:
-                    return torch.cat([x, x], dim=-1)
-                if cur > needed:
-                    return x[..., :needed]
-                pad = needed - cur
-                return F.pad(x, (0, pad))
-
-            add_text_embeds = fit_text_dim(pooled_prompt_embeds, needed_text_dim)
-            if negative_pooled_prompt_embeds is not None:
-                negative_pooled_prompt_embeds = fit_text_dim(negative_pooled_prompt_embeds, needed_text_dim)
+            # Adapter already outputs pooled text with the exact needed dim; pass through
+            add_text_embeds = pooled_prompt_embeds
 
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
                 try:
