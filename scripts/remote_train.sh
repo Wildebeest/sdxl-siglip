@@ -164,20 +164,24 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
-ARGS="$EXTRA_ARGS"
+TRAIN_URLS_POS="$1"; shift
+ARGS=("$@")
 # ensure per-run output dir unless provided by user
-case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${run_id}";; esac
+case " ${ARGS[*]} " in *" --output_dir "* ) :;; *) ARGS=("${ARGS[@]}" "--output_dir" "runs/${run_id}");; esac
 # keep W&B files under the run dir unless overridden
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls "$TRAIN_URLS" $ARGS > "$log" 2>&1 &
+nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls "$TRAIN_URLS_POS" "${ARGS[@]}" > "$log" 2>&1 &
 echo $! > "$run_dir/train.pid"
 echo "Started PID $(cat "$run_dir/train.pid")"
 echo "$run_dir/train.log"
 '
-  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" env EXTRA_ARGS="$EXTRA_ARGS" TRAIN_URLS="$TRAIN_URLS" bash -lc "$START_BG" | tail -n1)
+  # Split EXTRA_ARGS into words locally and pass as bash -c positional args
+  # shellcheck disable=SC2206
+  EXTRA_ARR=( $EXTRA_ARGS )
+  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG" -- "$TRAIN_URLS" "${EXTRA_ARR[@]}" | tail -n1)
   echo "Remote training started. Tail logs with:"
   echo "$SSH_CMD ${SSH_OPTS[*]} $HOST bash -lc 'cd $REMOTE_DIR_REMOTE; tail -f $LOGFILE'"
 else
@@ -189,7 +193,8 @@ set +o allexport
 if [ -f .env ]; then
   set -o allexport; . ./.env; set +o allexport
 fi
-ARGS="$EXTRA_ARGS"
+TRAIN_URLS_POS="$1"; shift
+ARGS=("$@")
 # create run dir and set outputs
 ts=$(date +%Y%m%d_%H%M%S)
 rnd=${RANDOM}
@@ -202,14 +207,16 @@ log="$run_dir/train.log"
 echo "Run ID: $run_id"
 echo "Logging to $log (and console)"
 # ensure per-run output dir unless provided by user
-case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${run_id}";; esac
+case " ${ARGS[*]} " in *" --output_dir "* ) :;; *) ARGS=("${ARGS[@]}" "--output_dir" "runs/${run_id}");; esac
 # keep W&B files under the run dir unless overridden
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-"$HOME/.local/bin/uv" run python train_baseline.py --train_urls "$TRAIN_URLS" $ARGS 2>&1 | tee "$log"
+"$HOME/.local/bin/uv" run python train_baseline.py --train_urls "$TRAIN_URLS_POS" "${ARGS[@]}" 2>&1 | tee "$log"
 '
-  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" env EXTRA_ARGS="$EXTRA_ARGS" TRAIN_URLS="$TRAIN_URLS" bash -lc "$START_FG"
+  # shellcheck disable=SC2206
+  EXTRA_ARR=( $EXTRA_ARGS )
+  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG" -- "$TRAIN_URLS" "${EXTRA_ARR[@]}"
   echo "Remote training finished."
 fi
