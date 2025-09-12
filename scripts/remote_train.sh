@@ -172,7 +172,9 @@ export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 || nohup uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 &
+# Resolve uv binary once, then background exactly one process
+UVBIN="$HOME/.local/bin/uv"; command -v "$UVBIN" >/dev/null 2>&1 || UVBIN="uv"
+nohup "$UVBIN" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 &
 echo $! > "$run_dir/train.pid"
 echo "Started PID $(cat "$run_dir/train.pid")"
 echo "$run_dir/train.log"

@@ -798,8 +798,40 @@ def train():
                 accelerator.print(f"noise_pred: {stats(noise_pred)} noise: {stats(noise)}")
 
             if not torch.isfinite(loss):
+                # Extended diagnostics on first occurrence
                 if is_main:
                     accelerator.print(f"Non-finite loss at step {step}; skipping optimizer step. loss={loss}")
+                    try:
+                        import json, os
+                        def _stats(x):
+                            try:
+                                x32 = x.detach().float()
+                                return {
+                                    "shape": tuple(x32.shape),
+                                    "min": float(x32.min().item()),
+                                    "max": float(x32.max().item()),
+                                    "mean": float(x32.mean().item()),
+                                    "std": float(x32.std(unbiased=False).item()),
+                                    "finite": bool(torch.isfinite(x32).all().item()),
+                                }
+                            except Exception:
+                                return {"error": "unavailable"}
+                        diag = {
+                            "step": int(step),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            "timesteps_head": timesteps[:8].detach().cpu().tolist() if 'timesteps' in locals() else [],
+                            "latents": _stats(latents),
+                            "noisy_latents": _stats(noisy_latents if 'noisy_latents' in locals() else noisy_latents_f32),
+                            "noise": _stats(noise),
+                            "noise_pred": _stats(noise_pred),
+                            "prompt_embeds_std": float(prompt_embeds.detach().float().std(unbiased=False).item()) if 'prompt_embeds' in locals() else None,
+                        }
+                        out_dir = os.path.join(args.output_dir, "logs")
+                        os.makedirs(out_dir, exist_ok=True)
+                        with open(os.path.join(out_dir, f"nan_diag_step{int(step)}.json"), "w") as f:
+                            json.dump(diag, f, indent=2)
+                    except Exception as e:
+                        accelerator.print(f"NaN diagnostics write failed: {e}")
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
                 continue
