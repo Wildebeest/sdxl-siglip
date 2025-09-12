@@ -804,19 +804,10 @@ def train():
             if negative_prompt_embeds is not None:
                 assert negative_prompt_embeds.dim() == 3, f"neg_prompt_embeds dim {negative_prompt_embeds.shape}"
 
-            # Pack added time ids used by SDXL and ensure add-embedding dims match UNet expectation.
-            # Compute time ids first, then adapt pooled embeds to required text-dim dynamically.
-            # Target text-embedding dim should represent TE1+TE2 pooled sizes.
-            proj_dim = int(pipe.text_encoder_2.config.projection_dim)
-            target_text_dim = 2 * proj_dim
-            add_time_ids = pipe._get_add_time_ids(
-                (1024, 1024),
-                (0, 0),
-                (1024, 1024),
-                dtype=unet.dtype,
-                text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
-            )
-            add_time_ids = add_time_ids.to(device)
+            # Build SDXL added time ids locally to avoid pipeline checks that can mismatch across versions.
+            bsz = noisy_latents.shape[0]
+            h, w = 1024, 1024
+            add_time_ids = torch.tensor([h, w, 0, 0, h, w], dtype=unet.dtype, device=device).unsqueeze(0).repeat(bsz, 1)
 
             # Adapter already outputs pooled text with the exact needed dim; pass through
             add_text_embeds = pooled_prompt_embeds
@@ -826,8 +817,12 @@ def train():
                     in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
                 except Exception:
                     in_features = -1
+                # Probe the actual time embedding width used by the UNet
+                with torch.no_grad():
+                    tproj = unet.add_time_proj(add_time_ids[0].flatten())
+                    time_dim = int(tproj.reshape(1, -1).shape[-1])
                 accelerator.print(
-                    f"add_embed debug: in_features={in_features} time_ids_in={int(add_time_ids.shape[-1])} "
+                    f"add_embed debug: in_features={in_features} time_dim={time_dim} "
                     f"pooled_dim={int(pooled_prompt_embeds.shape[-1])} add_text_dim={int(add_text_embeds.shape[-1])}"
                 )
 
