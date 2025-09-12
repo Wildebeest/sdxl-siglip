@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -16,6 +17,7 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 )
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer
+import wandb
 
 
 # Optional but commonly available in Transformers >=4.38
@@ -230,6 +232,11 @@ def train():
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"]) 
     parser.add_argument("--guidance_scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
+    # wandb options
+    parser.add_argument("--wandb_project", type=str, default="sdxl-siglip")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default=os.environ.get("WANDB_MODE", "online"), choices=["online", "offline", "disabled"]) 
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -278,6 +285,10 @@ def train():
     unet, vae, optimizer = accelerator.prepare(unet, vae, optimizer)
 
     step = 0
+    is_main = accelerator.is_main_process
+    if is_main and args.wandb_mode != "disabled":
+        mode = "disabled" if args.wandb_mode == "disabled" else args.wandb_mode
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name, config=vars(args), mode=mode)
     pipe.text_encoder_2.hidden_proj.train()
     pipe.text_encoder_2.pool_proj.train()
     unet.train()
@@ -289,6 +300,7 @@ def train():
         images, texts = batch  # images: [B,3,1024,1024], texts: list[str]
 
         with accelerator.accumulate(unet):
+            t0 = time.time()
             images = images.to(device)
 
             # Latents (no grad for VAE encode)
@@ -340,6 +352,13 @@ def train():
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if is_main and (step % 10 == 0):
+                wandb.log({
+                    "train/loss": float(loss.detach().cpu()),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/step_time_s": time.time() - t0,
+                    "global_step": step,
+                }, step=step)
 
         if accelerator.is_main_process and step % 50 == 0:
             accelerator.print(f"step {step}: loss={loss.item():.4f}")
@@ -348,6 +367,9 @@ def train():
 
     if accelerator.is_main_process:
         save_adapter(pipe.text_encoder_2, os.path.join(args.output_dir, "adapter"))
+        if args.wandb_mode != "disabled":
+            wandb.save(os.path.join(args.output_dir, "adapter", "siglip_adapter.pt"))
+            wandb.finish()
 
     accelerator.print("Training complete.")
 
