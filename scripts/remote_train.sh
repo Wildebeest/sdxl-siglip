@@ -181,7 +181,7 @@ echo "$run_dir/train.log"
   # Split EXTRA_ARGS into words locally and pass as bash -c positional args
   # shellcheck disable=SC2206
   EXTRA_ARR=( $EXTRA_ARGS )
-  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG" -- "$TRAIN_URLS" "${EXTRA_ARR[@]}" | tail -n1)
+  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG" bash "$TRAIN_URLS" "${EXTRA_ARR[@]}" | tail -n1)
   echo "Remote training started. Tail logs with:"
   echo "$SSH_CMD ${SSH_OPTS[*]} $HOST bash -lc 'cd $REMOTE_DIR_REMOTE; tail -f $LOGFILE'"
 else
@@ -217,6 +217,6 @@ set +o braceexpand; set -o noglob
 '
   # shellcheck disable=SC2206
   EXTRA_ARR=( $EXTRA_ARGS )
-  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG" -- "$TRAIN_URLS" "${EXTRA_ARR[@]}"
+  $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG" bash "$TRAIN_URLS" "${EXTRA_ARR[@]}"
   echo "Remote training finished."
 fi
