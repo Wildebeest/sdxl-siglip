@@ -108,7 +108,7 @@ class SiglipAsTextEncoder(nn.Module):
         pooled = self.pool_proj(pooled)
 
         # Construct a tuple where [-2] works reliably
-        hs: Tuple[torch.Tensor, ...] = (torch.empty(0, device=seq_feats.device), seq_feats)
+        hs: Tuple[torch.Tensor, ...] = (seq_feats, torch.empty(0, device=seq_feats.device))
         return _AdapterOutput(pooled, hs)
 
     @property
@@ -589,7 +589,7 @@ def train():
             dt = time.time() - t0
             step_time_ema = dt if step_time_ema is None else 0.9 * step_time_ema + 0.1 * dt
 
-            if is_main and (step % 10 == 0):
+            if is_main and args.wandb_mode != "disabled" and (step % 10 == 0):
                 remaining = max(args.max_steps - (step + 1), 0)
                 eta_sec = (step_time_ema or dt) * remaining
                 elapsed = time.time() - start_time
