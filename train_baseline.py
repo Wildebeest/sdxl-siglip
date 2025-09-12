@@ -764,10 +764,8 @@ def train():
             if negative_prompt_embeds is not None:
                 assert negative_prompt_embeds.dim() == 3, f"neg_prompt_embeds dim {negative_prompt_embeds.shape}"
 
-            # Pack added time ids used by SDXL
-            # SigLIP-only adapter outputs pooled embeddings with the correct size
-            # (TE1+TE2 concatenated) so we pass them as-is.
-            add_text_embeds = pooled_prompt_embeds
+            # Pack added time ids used by SDXL and ensure add-embedding dims match UNet expectation.
+            # Compute time ids first, then adapt pooled embeds to required text-dim dynamically.
             add_time_ids = pipe._get_add_time_ids(
                 (1024, 1024),
                 (0, 0),
@@ -776,6 +774,30 @@ def train():
                 text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
             )
             add_time_ids = add_time_ids.to(device)
+
+            # UNet add-embedding expects: in_features = text_dim (TE1+TE2 pooled) + time_ids_dim.
+            try:
+                in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
+            except Exception:
+                in_features = 2816  # SDXL default
+            time_dim = int(add_time_ids.shape[-1])
+            needed_text_dim = max(in_features - time_dim, 0)
+
+            def fit_text_dim(x: torch.Tensor, needed: int) -> torch.Tensor:
+                cur = int(x.shape[-1])
+                if cur == needed:
+                    return x
+                if 2 * cur == needed:
+                    return torch.cat([x, x], dim=-1)
+                if cur > needed:
+                    return x[..., :needed]
+                # pad with zeros if smaller (unlikely)
+                pad = needed - cur
+                return F.pad(x, (0, pad))
+
+            add_text_embeds = fit_text_dim(pooled_prompt_embeds, needed_text_dim)
+            if negative_pooled_prompt_embeds is not None:
+                negative_pooled_prompt_embeds = fit_text_dim(negative_pooled_prompt_embeds, needed_text_dim)
 
             # CFG
             autocast_ctx = amp_ctx
