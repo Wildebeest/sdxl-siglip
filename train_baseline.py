@@ -601,7 +601,24 @@ def train():
             with torch.no_grad():
                 with amp_ctx:
                     latents = to_latents(vae, images, dtype=unet.dtype)
-            noisy_latents, noise, timesteps = add_noise(latents, noise_scheduler)
+            # Add noise: in safe-start, compute in float32 and restrict timestep band
+            if use_fp32:
+                lat_f32 = latents.float()
+                bsz = lat_f32.shape[0]
+                num_ts = int(getattr(noise_scheduler.config, "num_train_timesteps", 1000))
+                t_low = max(0, int(0.2 * num_ts))
+                t_high = max(t_low + 1, int(0.8 * num_ts))
+                timesteps = torch.randint(t_low, t_high, (bsz,), device=lat_f32.device, dtype=torch.long)
+                noise_f32 = torch.randn_like(lat_f32)
+                noisy_latents_f32 = noise_scheduler.add_noise(lat_f32, noise_f32, timesteps)
+                # Retry once if non-finite
+                if not torch.isfinite(noisy_latents_f32).all():
+                    noise_f32 = torch.randn_like(lat_f32)
+                    noisy_latents_f32 = noise_scheduler.add_noise(lat_f32.clamp_(-10, 10), noise_f32, timesteps)
+                noisy_latents = noisy_latents_f32.to(dtype=unet.dtype)
+                noise = noise_f32.to(dtype=unet.dtype)
+            else:
+                noisy_latents, noise, timesteps = add_noise(latents, noise_scheduler)
 
             # Text conditioning (uses our swapped SigLIP encoder for pooled + seq embeds)
             prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_text(
