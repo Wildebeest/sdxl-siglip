@@ -595,10 +595,16 @@ def train():
             t0 = time.time()
             images = images.to(device)
 
-            # Latents (no grad for VAE encode)
+            use_fp32 = step < args.safe_start_steps
+            # Latents (no grad for VAE encode) in safe-start precision
+            amp_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
             with torch.no_grad():
-                latents = to_latents(vae, images, dtype=unet.dtype)
+                with amp_ctx:
+                    latents = to_latents(vae, images, dtype=(torch.float32 if use_fp32 else unet.dtype))
             noisy_latents, noise, timesteps = add_noise(latents, noise_scheduler)
+            if use_fp32:
+                noisy_latents = noisy_latents.float()
+                noise = noise.float()
 
             # Text conditioning (uses our swapped SigLIP encoder for pooled + seq embeds)
             prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_text(
@@ -637,8 +643,7 @@ def train():
             add_time_ids = add_time_ids.to(device)
 
             # CFG
-            use_fp32 = step < args.safe_start_steps
-            autocast_ctx = torch.amp.autocast("cuda", enabled=(accelerator.mixed_precision != "no" and not use_fp32))
+            autocast_ctx = amp_ctx
             if args.guidance_scale > 1.0:
                 with autocast_ctx:
                     noise_pred_uncond = unet(
@@ -664,6 +669,21 @@ def train():
                     ).sample
 
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+
+            # Debug: UNet output and noise stats
+            if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                def stats(x):
+                    x32 = x.detach().float()
+                    return {
+                        "shape": tuple(x32.shape),
+                        "min": float(x32.min().item()),
+                        "max": float(x32.max().item()),
+                        "mean": float(x32.mean().item()),
+                        "std": float(x32.std(unbiased=False).item()),
+                        "norm": float(x32.norm().item()),
+                    }
+                accelerator.print(f"noisy_latents: {stats(noisy_latents)} timesteps: {timesteps[:4].tolist()}")
+                accelerator.print(f"noise_pred: {stats(noise_pred)} noise: {stats(noise)}")
 
             if not torch.isfinite(loss):
                 if is_main:
