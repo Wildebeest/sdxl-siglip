@@ -422,6 +422,10 @@ def train():
     if is_main:
         b2_bucket, b2_prefix = maybe_init_b2(args.b2_bucket, args.b2_prefix)
 
+    # ETA tracking
+    start_time = time.time()
+    step_time_ema = None  # exponential moving average of step time
+
     for batch in loader:
         if step >= args.max_steps:
             break
@@ -481,11 +485,28 @@ def train():
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            # Update EMA of step time
+            dt = time.time() - t0
+            step_time_ema = dt if step_time_ema is None else 0.9 * step_time_ema + 0.1 * dt
+
             if is_main and (step % 10 == 0):
+                remaining = max(args.max_steps - (step + 1), 0)
+                eta_sec = (step_time_ema or dt) * remaining
+                elapsed = time.time() - start_time
+                # human-readable ETA
+                hrs = int(eta_sec // 3600)
+                mins = int((eta_sec % 3600) // 60)
+                secs = int(eta_sec % 60)
+                eta_str = f"{hrs:d}:{mins:02d}:{secs:02d}"
                 wandb.log({
                     "train/loss": float(loss.detach().cpu()),
                     "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/step_time_s": time.time() - t0,
+                    "train/step_time_s": dt,
+                    "train/step_time_ema_s": float(step_time_ema or dt),
+                    "train/eta_seconds": float(eta_sec),
+                    "train/eta": eta_str,
+                    "train/elapsed_s": float(elapsed),
+                    "train/steps_per_sec_ema": (0.0 if (step_time_ema or dt) == 0 else 1.0 / float(step_time_ema or dt)),
                     "global_step": step,
                 }, step=step)
 
