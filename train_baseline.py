@@ -805,8 +805,30 @@ def train():
             )
             add_time_ids = add_time_ids.to(device)
 
-            # Adapter now outputs 2x projection_dim in single-encoder mode; pass through as-is
-            add_text_embeds = pooled_prompt_embeds
+            # Fit pooled text embeds to the UNet add-embedding expected text_dim
+            try:
+                in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
+            except Exception:
+                in_features = 2816
+            add_ids_len = int(add_time_ids.shape[-1])
+            time_dim_each = int(getattr(unet.config, 'addition_time_embed_dim', 256))
+            total_time_dim = time_dim_each * add_ids_len
+            needed_text_dim = max(in_features - total_time_dim, 0)
+
+            def fit_text_dim(x: torch.Tensor, needed: int) -> torch.Tensor:
+                cur = int(x.shape[-1])
+                if cur == needed:
+                    return x
+                if 2 * cur == needed:
+                    return torch.cat([x, x], dim=-1)
+                if cur > needed:
+                    return x[..., :needed]
+                pad = needed - cur
+                return F.pad(x, (0, pad))
+
+            add_text_embeds = fit_text_dim(pooled_prompt_embeds, needed_text_dim)
+            if negative_pooled_prompt_embeds is not None:
+                negative_pooled_prompt_embeds = fit_text_dim(negative_pooled_prompt_embeds, needed_text_dim)
 
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
                 try:
