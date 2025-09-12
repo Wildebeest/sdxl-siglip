@@ -208,7 +208,13 @@ def swap_text_encoder_2_for_siglip(
         except Exception as e:  # pragma: no cover
             raise RuntimeError("Could not infer original text_encoder_2 hidden size.") from e
 
-    target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
+    # For single-encoder mode, we must output pooled embeddings matching the
+    # concatenation of TE1+TE2 pooled dims expected by SDXL's UNet add_embedding.
+    # That is typically 2 * orig_te2.projection_dim.
+    if single_encoder:
+        target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden)) * 2
+    else:
+        target_proj = int(getattr(orig_te2.config, "projection_dim", target_hidden))
 
     # Create SigLIP tokenizer (max length set after model init)
     tokenizer_2 = AutoTokenizer.from_pretrained(siglip_id, use_fast=True)
@@ -729,10 +735,9 @@ def train():
                 assert negative_prompt_embeds.dim() == 3, f"neg_prompt_embeds dim {negative_prompt_embeds.shape}"
 
             # Pack added time ids used by SDXL
-            # SDXL UNet expects concatenated pooled embeds from TE1 and TE2 (each ~1280),
-            # followed by 256-dim time ids -> total in_features ~ 2816.
-            # In SigLIP-only mode, duplicate the pooled embed to fill both slots.
-            add_text_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=-1)
+            # SigLIP-only adapter outputs pooled embeddings with the correct size
+            # (TE1+TE2 concatenated) so we pass them as-is.
+            add_text_embeds = pooled_prompt_embeds
             add_time_ids = pipe._get_add_time_ids(
                 (1024, 1024),
                 (0, 0),
@@ -749,9 +754,9 @@ def train():
                     noise_pred_uncond = unet(
                         noisy_latents,
                         timesteps,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        added_cond_kwargs={"text_embeds": torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds], dim=-1), "time_ids": add_time_ids},
-                    ).sample
+                    encoder_hidden_states=negative_prompt_embeds,
+                    added_cond_kwargs={"text_embeds": negative_pooled_prompt_embeds, "time_ids": add_time_ids},
+                ).sample
                     noise_pred_text = unet(
                         noisy_latents,
                         timesteps,
