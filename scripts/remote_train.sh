@@ -172,12 +172,12 @@ export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 || nohup uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 &
+nohup "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS > "$log" 2>&1 &
 echo $! > "$run_dir/train.pid"
 echo "Started PID $(cat "$run_dir/train.pid")"
 echo "$run_dir/train.log"
 '
-  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG")
+  LOGFILE=$($SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_BG" | tail -n1)
   echo "Remote training started. Tail logs with:"
   echo "$SSH_CMD ${SSH_OPTS[*]} $HOST bash -lc 'cd $REMOTE_DIR_REMOTE; tail -f $LOGFILE'"
 else
@@ -208,7 +208,7 @@ export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS 2>&1 | tee "$log" || uv run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS 2>&1 | tee -a "$log"
+"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS"' $ARGS 2>&1 | tee "$log"
 '
   $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG"
   echo "Remote training finished."
