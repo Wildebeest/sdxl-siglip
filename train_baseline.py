@@ -766,42 +766,33 @@ def train():
 
             # Pack added time ids used by SDXL and ensure add-embedding dims match UNet expectation.
             # Compute time ids first, then adapt pooled embeds to required text-dim dynamically.
+            # Target text-embedding dim should represent TE1+TE2 pooled sizes.
+            proj_dim = int(pipe.text_encoder_2.config.projection_dim)
+            target_text_dim = 2 * proj_dim
             add_time_ids = pipe._get_add_time_ids(
                 (1024, 1024),
                 (0, 0),
                 (1024, 1024),
                 dtype=unet.dtype,
-                text_encoder_projection_dim=int(pipe.text_encoder_2.config.projection_dim),
+                text_encoder_projection_dim=target_text_dim,
             )
             add_time_ids = add_time_ids.to(device)
 
-            # UNet add-embedding expects: in_features = text_dim (TE1+TE2 pooled) + time_ids_dim.
-            try:
-                in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
-            except Exception:
-                in_features = 2816  # SDXL default
-            time_dim = int(add_time_ids.shape[-1])
-            needed_text_dim = max(in_features - time_dim, 0)
-
-            def fit_text_dim(x: torch.Tensor, needed: int) -> torch.Tensor:
-                cur = int(x.shape[-1])
-                if cur == needed:
-                    return x
-                if 2 * cur == needed:
-                    return torch.cat([x, x], dim=-1)
-                if cur > needed:
-                    return x[..., :needed]
-                # pad with zeros if smaller (unlikely)
-                pad = needed - cur
-                return F.pad(x, (0, pad))
-
-            add_text_embeds = fit_text_dim(pooled_prompt_embeds, needed_text_dim)
-            if negative_pooled_prompt_embeds is not None:
-                negative_pooled_prompt_embeds = fit_text_dim(negative_pooled_prompt_embeds, needed_text_dim)
+            # Ensure pooled text embedding matches TE1+TE2 pooled dim by duplicating if needed
+            if int(pooled_prompt_embeds.shape[-1]) != target_text_dim:
+                add_text_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=-1)
+                if negative_pooled_prompt_embeds is not None:
+                    negative_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds], dim=-1)
+            else:
+                add_text_embeds = pooled_prompt_embeds
 
             if is_main and args.debug_log and (step < 5 or step % 50 == 0):
+                try:
+                    in_features = int(getattr(getattr(unet, 'add_embedding', None), 'linear_1', None).in_features)  # type: ignore
+                except Exception:
+                    in_features = -1
                 accelerator.print(
-                    f"add_embed debug: in_features={in_features} time_dim={time_dim} needed_text_dim={needed_text_dim} "
+                    f"add_embed debug: in_features={in_features} time_ids_in={int(add_time_ids.shape[-1])} "
                     f"pooled_dim={int(pooled_prompt_embeds.shape[-1])} add_text_dim={int(add_text_embeds.shape[-1])}"
                 )
 
