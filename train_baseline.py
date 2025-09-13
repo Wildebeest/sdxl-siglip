@@ -1006,14 +1006,22 @@ def train():
                 prompts = [str(ex["prompt"]) for ex in compare_pairs]
                 with torch.no_grad():
                     g = torch.Generator(device=device).manual_seed(args.sample_seed)
-                    gen_images = pipe(
-                        prompt=prompts,
-                        num_inference_steps=args.sample_steps,
-                        guidance_scale=args.guidance_scale,
-                        height=args.sample_height,
-                        width=args.sample_width,
-                        generator=g,
-                    ).images
+                    # Run generation under autocast to match mixed precision and avoid dtype mismatches
+                    gen_amp_dtype = None
+                    if accelerator.mixed_precision == "bf16":
+                        gen_amp_dtype = torch.bfloat16
+                    elif accelerator.mixed_precision == "fp16":
+                        gen_amp_dtype = torch.float16
+                    gen_ctx = torch.amp.autocast("cuda", dtype=gen_amp_dtype, enabled=(gen_amp_dtype is not None))
+                    with gen_ctx:
+                        gen_images = pipe(
+                            prompt=prompts,
+                            num_inference_steps=args.sample_steps,
+                            guidance_scale=args.guidance_scale,
+                            height=args.sample_height,
+                            width=args.sample_width,
+                            generator=g,
+                        ).images
                 tbl = wandb.Table(columns=["prompt", "training_image", "generated_image"])
                 for ex, gi in zip(compare_pairs, gen_images):
                     tbl.add_data(ex["prompt"], wandb.Image(ex["train_img"]), wandb.Image(gi))
