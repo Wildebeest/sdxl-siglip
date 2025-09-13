@@ -174,6 +174,8 @@ case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${ru
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
+# Reduce CUDA memory fragmentation on long runs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set +o braceexpand; set -o noglob
 # Resolve uv binary once, then background exactly one process
 UVBIN="$HOME/.local/bin/uv"; command -v "$UVBIN" >/dev/null 2>&1 || UVBIN="uv"
@@ -225,6 +227,8 @@ case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${ru
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
+# Reduce CUDA memory fragmentation on long runs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set +o braceexpand; set -o noglob
 # Determine available GPU count; fall back to 1 on error
 GPU_COUNT=$( (nvidia-smi -L 2>/dev/null | wc -l) || echo 0 )
