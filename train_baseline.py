@@ -423,7 +423,9 @@ def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: st
                 im = im2.copy()
         return im.convert("RGB")
 
-    rng = torch.Generator().manual_seed(seed)
+    # WebDataset expects a Python-style RNG with a randint interface; torch.Generator doesn't provide that.
+    import random
+    rng = random.Random(int(seed))
     transform = build_train_transform()
     ds = (
         wds.WebDataset(urls, handler=wds.ignore_and_continue, nodesplitter=wds.split_by_node)
