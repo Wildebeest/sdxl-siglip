@@ -184,7 +184,8 @@ if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -lt 1 ]; then GPU_COUNT=1; fi
 # Prefer multi-GPU via Accelerate when >1 GPU is detected
 if [ "$GPU_COUNT" -gt 1 ]; then
   echo "Launching with Accelerate across $GPU_COUNT GPUs"
-  nohup "$UVBIN" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+  # Prefer bf16 on modern NVIDIA GPUs; users can override via EXTRA_ARGS for train script
+  nohup "$UVBIN" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "bf16" \
     python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
 else
   nohup "$UVBIN" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
@@ -231,9 +232,9 @@ if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -lt 1 ]; then GPU_COUNT=1; fi
 
 if [ "$GPU_COUNT" -gt 1 ]; then
   echo "Launching with Accelerate across $GPU_COUNT GPUs"
-  "$HOME/.local/bin/uv" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+  "$HOME/.local/bin/uv" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "bf16" \
     python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" \
-    || uv run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+    || uv run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "bf16" \
        python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee -a "$log"
 else
   "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" \
