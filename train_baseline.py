@@ -587,6 +587,14 @@ def train():
 
     # Use the pipeline's scheduler/vae/unet directly
     noise_scheduler = pipe.scheduler
+    # Use a training-friendly scheduler for add_noise; many inference schedulers (e.g., EulerDiscrete)
+    # expect set_timesteps() and don't expose training alphas. Switch to DDPMScheduler using the
+    # same config to generate training noise consistently.
+    try:
+        from diffusers import DDPMScheduler
+        noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    except Exception:
+        pass
     vae = pipe.vae
     unet = pipe.unet
 
