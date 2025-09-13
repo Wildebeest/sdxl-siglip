@@ -177,7 +177,18 @@ if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
 # Resolve uv binary once, then background exactly one process
 UVBIN="$HOME/.local/bin/uv"; command -v "$UVBIN" >/dev/null 2>&1 || UVBIN="uv"
-nohup "$UVBIN" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
+# Determine available GPU count; fall back to 1 on error
+GPU_COUNT=$( (nvidia-smi -L 2>/dev/null | wc -l) || echo 0 )
+if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -lt 1 ]; then GPU_COUNT=1; fi
+
+# Prefer multi-GPU via Accelerate when >1 GPU is detected
+if [ "$GPU_COUNT" -gt 1 ]; then
+  echo "Launching with Accelerate across $GPU_COUNT GPUs"
+  nohup "$UVBIN" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+    python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
+else
+  nohup "$UVBIN" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS > "$log" 2>&1 &
+fi
 echo $! > "$run_dir/train.pid"
 echo "Started PID $(cat "$run_dir/train.pid")"
 echo "$run_dir/train.log"
@@ -214,7 +225,20 @@ export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
 if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
 set +o braceexpand; set -o noglob
-"$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" || uv run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee -a "$log"
+# Determine available GPU count; fall back to 1 on error
+GPU_COUNT=$( (nvidia-smi -L 2>/dev/null | wc -l) || echo 0 )
+if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -lt 1 ]; then GPU_COUNT=1; fi
+
+if [ "$GPU_COUNT" -gt 1 ]; then
+  echo "Launching with Accelerate across $GPU_COUNT GPUs"
+  "$HOME/.local/bin/uv" run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+    python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" \
+    || uv run accelerate launch --num_processes "$GPU_COUNT" --num_machines 1 --mixed_precision "auto" \
+       python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee -a "$log"
+else
+  "$HOME/.local/bin/uv" run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee "$log" \
+    || uv run python train_baseline.py --train_urls '"$TRAIN_URLS_ESC"' $ARGS 2>&1 | tee -a "$log"
+fi
 '
   $SSH_CMD "${SSH_OPTS[@]}" "$HOST" bash -lc "$START_FG"
   echo "Remote training finished."
