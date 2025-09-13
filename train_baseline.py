@@ -21,6 +21,9 @@ from transformers import AutoTokenizer
 from torch.cuda.amp import autocast
 import wandb
 
+# Lightweight import of save_adapter from utils to keep IO logic centralized
+from utils.adapter_io import save_adapter
+
 # Optional: Backblaze B2 SDK for checkpoint uploads
 try:
     from b2sdk.v2 import InMemoryAccountInfo, B2Api
@@ -438,14 +441,7 @@ def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: st
     return out
 
 
-def save_adapter(adapter: SiglipAsTextEncoder, out_dir: str, filename: str = "siglip_adapter.pt"):
-    os.makedirs(out_dir, exist_ok=True)
-    torch.save({
-        "hidden_proj": adapter.hidden_proj.state_dict(),
-        "pool_proj": adapter.pool_proj.state_dict(),
-        "siglip_config": adapter.model.config.to_dict(),
-        "projection_dim": adapter.config.projection_dim,
-    }, os.path.join(out_dir, filename))
+## save_adapter is provided by utils.adapter_io
 
 
 def maybe_init_b2(bucket_name: str, prefix: Optional[str] = None):
