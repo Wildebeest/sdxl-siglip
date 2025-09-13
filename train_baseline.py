@@ -385,7 +385,7 @@ def make_wds_loader(urls: str, batch_size: int, num_workers: int = 4, image_key:
     transform = build_train_transform()
 
     dataset = (
-        wds.WebDataset(urls, handler=wds.ignore_and_continue)
+        wds.WebDataset(urls, handler=wds.ignore_and_continue, nodesplitter=wds.split_by_node)
         .decode("pil")
         .to_tuple(image_key, text_key)
         .map_tuple(lambda img: transform(decode_img(img)), lambda txt: txt.decode("utf-8") if isinstance(txt, (bytes, bytearray)) else str(txt))
@@ -426,7 +426,7 @@ def sample_training_examples(urls: str, n: int, seed: int = 12345, image_key: st
     rng = torch.Generator().manual_seed(seed)
     transform = build_train_transform()
     ds = (
-        wds.WebDataset(urls, handler=wds.ignore_and_continue)
+        wds.WebDataset(urls, handler=wds.ignore_and_continue, nodesplitter=wds.split_by_node)
         .shuffle(1000, rng=rng)
         .decode("pil")
         .to_tuple(image_key, text_key)
