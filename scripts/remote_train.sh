@@ -14,7 +14,8 @@ usage() {
 Usage: scripts/remote_train.sh --host user@host --train-urls "wds_pattern" \
        [--remote-dir "~/sdxl-siglip"] [--background] [--no-background] [--ssh "ssh -p 22"] \
        [--accept-new-hostkey] [--no-accept-new-hostkey] \
-       [--extra-args "--batch_size 1 --max_steps 1000 --wandb_project sdxl-siglip"]
+       [--extra-args "--batch_size 1 --max_steps 1000 --wandb_project sdxl-siglip"] \
+       [--run-name "my_descriptive_run_name"]
 
 Required:
   --host           SSH target, e.g. ubuntu@10.0.0.5
@@ -28,6 +29,7 @@ Optional:
   --background     Run training under nohup in background (default)
   --no-background  Run training attached in foreground
   --extra-args     Extra args forwarded to train_baseline.py
+  --run-name       Optional W&B run name; also passed as --wandb_name
 
 Notes:
   - Expects a local .env; will scp to remote repo root.
@@ -43,6 +45,7 @@ BACKGROUND=1
 EXTRA_ARGS=""
 SSH_OPTS=()
 ACCEPT_NEW=1
+RUN_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --background) BACKGROUND=1; shift;;
     --no-background) BACKGROUND=0; shift;;
     --extra-args) EXTRA_ARGS="$2"; shift 2;;
+    --run-name) RUN_NAME="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2;;
   esac
@@ -104,6 +108,7 @@ REMOTE_DIR_TILDE="$REMOTE_DIR"
 # Shell-escape values for safe injection into remote script
 EXTRA_ARGS_ESC=$(printf %q "$EXTRA_ARGS")
 TRAIN_URLS_ESC=$(printf %q "$TRAIN_URLS")
+RUN_NAME_ESC=$(printf %q "$RUN_NAME")
 REMOTE_BOOTSTRAP='set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
@@ -170,10 +175,17 @@ fi
 ARGS='"$EXTRA_ARGS_ESC"'
 # ensure per-run output dir unless provided by user
 case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${run_id}";; esac
+# set W&B run name if provided and not already in ARGS
+RN='"$RUN_NAME_ESC"'
+if [ -n "$RN" ]; then
+  case " $ARGS " in *" --wandb_name "* ) :;; *) ARGS="$ARGS --wandb_name $RN";; esac
+fi
 # keep W&B files under the run dir unless overridden
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
-if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
+if [ -z "${WANDB_NAME:-}" ]; then
+  if [ -n "$RN" ]; then export WANDB_NAME="$RN"; else export WANDB_NAME="run-${run_id}"; fi
+fi
 # Reduce CUDA memory fragmentation on long runs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set +o braceexpand; set -o noglob
@@ -223,10 +235,17 @@ echo "Run ID: $run_id"
 echo "Logging to $log (and console)"
 # ensure per-run output dir unless provided by user
 case " $ARGS " in *" --output_dir "* ) :;; *) ARGS="$ARGS --output_dir runs/${run_id}";; esac
+# set W&B run name if provided and not already in ARGS
+RN='"$RUN_NAME_ESC"'
+if [ -n "$RN" ]; then
+  case " $ARGS " in *" --wandb_name "* ) :;; *) ARGS="$ARGS --wandb_name $RN";; esac
+fi
 # keep W&B files under the run dir unless overridden
 export WANDB_DIR="${run_dir}/wandb"
 mkdir -p "$WANDB_DIR"
-if [ -z "${WANDB_NAME:-}" ]; then export WANDB_NAME="run-${run_id}"; fi
+if [ -z "${WANDB_NAME:-}" ]; then
+  if [ -n "$RN" ]; then export WANDB_NAME="$RN"; else export WANDB_NAME="run-${run_id}"; fi
+fi
 # Reduce CUDA memory fragmentation on long runs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set +o braceexpand; set -o noglob
